@@ -1,0 +1,66 @@
+# OS files
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+
+*.log
+logs/
+
+# Local environment / secrets
+
+.env
+.env.*
+!.env.example
+
+# Shell history / temporary files
+
+*.tmp
+*.temp
+
+# macOS
+
+.AppleDouble
+.LSOverride
+
+# Windows
+
+$RECYCLE.BIN/
+*.stackdump
+
+# Build / generated files
+
+dist/
+build/
+out/
+coverage/
+
+# Node
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Python
+
+**pycache**/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Local project configuration
+
+.sherpa/
