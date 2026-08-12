@@ -474,12 +474,6 @@ Keep the separation between **gathering user intent** and **executing changes** 
 
 ---
 
-## 📄 License
-
-This project is licensed under the MIT License. See `LICENSE` for details.
-
----
-
 ## 🏔️ Why "Sherpa"?
 
 A Sherpa carries the heavy gear so you can focus on the climb.
