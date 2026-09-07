@@ -36,11 +36,21 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # =============================================================================
 # Config & globals
 # =============================================================================
 
 PLATFORM=""   # "mac" | "windows"
+
+PROFILE_FILE=""
+PROFILE_MODE=false
+PROFILE_NAME=""
+NODE_VERSION="lts"
+PYTHON_VERSION="3.12.4"
+GIT_SSH_SETUP=false
+CLONE_REPOS=()
 
 # --- Answers collected during GATHER, consumed during EXECUTE ---
 GIT_ALREADY_INSTALLED=false
@@ -65,9 +75,6 @@ WANT_STARSHIP=false
 GITCONFIG_NEEDED=false
 GITCONFIG_NAME=""
 GITCONFIG_EMAIL=""
-
-WANT_SSH_KEY=false
-SSH_EMAIL=""
 
 WANT_CLONE=false
 CLONE_URLS_RAW=""
@@ -302,6 +309,187 @@ cleanup_on_interrupt() {
 trap cleanup_on_interrupt INT
 trap 'tput cnorm 2>/dev/null || true' EXIT
 
+usage() {
+  cat <<'EOF'
+Usage: sherpa-setup.sh [options]
+
+Options:
+  --profile <file>   Read stack from a sherpa.yml profile (skips the wizard)
+  -h, --help         Show this help
+
+Examples:
+  ./sherpa-setup.sh
+  ./sherpa-setup.sh --profile sherpa.yml
+  ./sherpa-setup.sh --profile ./team-bundle/sherpa.yml
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile)
+        [ $# -ge 2 ] || { echo -e "${RED}--profile requires a file path.${NC}"; exit 1; }
+        PROFILE_FILE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo -e "${RED}Unknown option: $1${NC}"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+expand_home() {
+  local path="$1"
+  case "$path" in
+    "~") echo "$HOME" ;;
+    "~/"*) echo "$HOME/${path#~/}" ;;
+    *) echo "$path" ;;
+  esac
+}
+
+resolve_repo_url() {
+  local repo="$1"
+  if [[ "$repo" == git@* ]] || [[ "$repo" == https://* ]] || [[ "$repo" == http://* ]]; then
+    echo "$repo"
+  elif [[ "$repo" == */* ]]; then
+    echo "git@github.com:${repo}.git"
+  else
+    echo "$repo"
+  fi
+}
+
+load_profile() {
+  local parser="$SCRIPT_DIR/sherpa-profile.py"
+  if [ ! -f "$PROFILE_FILE" ]; then
+    echo -e "${RED}Profile not found: $PROFILE_FILE${NC}"
+    exit 1
+  fi
+  if [ ! -f "$parser" ]; then
+    echo -e "${RED}Profile parser not found: $parser${NC}"
+    echo "Make sure sherpa-profile.py sits next to sherpa-setup.sh."
+    exit 1
+  fi
+  if ! has_cmd python3; then
+    echo -e "${RED}python3 is required to read profile files.${NC}"
+    exit 1
+  fi
+  local parsed
+  if ! parsed="$(python3 "$parser" "$PROFILE_FILE" bash)"; then
+    echo -e "${RED}Failed to parse profile: $PROFILE_FILE${NC}"
+    exit 1
+  fi
+  # shellcheck disable=SC2086
+  eval "$parsed"
+  CLONE_DIR="$(expand_home "$CLONE_DIR")"
+}
+
+plan_from_profile() {
+  plan_line "Profile: $PROFILE_NAME (from $(basename "$PROFILE_FILE"))"
+
+  if has_cmd git; then
+    GIT_ALREADY_INSTALLED=true
+    plan_line "Git: already installed ($(git --version | awk '{print $3}'))"
+  else
+    GIT_WANT_INSTALL=true
+    plan_line "Git: install"
+  fi
+
+  case $IDE_CHOICE in
+    0) plan_line "IDE: install Zed" ;;
+    1) plan_line "IDE: install VS Code" ;;
+    2) plan_line "IDE: install Zed and VS Code" ;;
+    3) plan_line "IDE: skip" ;;
+  esac
+  if [ "$IDE_CHOICE" -eq 1 ] || [ "$IDE_CHOICE" -eq 2 ]; then
+    if $WANT_VSCODE_EXTENSIONS; then
+      plan_line "VS Code extensions: install Prettier, ESLint, GitLens"
+    else
+      plan_line "VS Code extensions: skip"
+    fi
+  fi
+
+  case $NODE_CHOICE in
+    0) plan_line "Node.js: install via nvm (version: $NODE_VERSION)" ;;
+    1) plan_line "Node.js: install LTS directly" ;;
+    2) plan_line "Node.js: skip" ;;
+  esac
+  case $PKG_MANAGER_CHOICE in
+    0) plan_line "Package manager: npm" ;;
+    1) plan_line "Package manager: pnpm" ;;
+    2) plan_line "Package manager: yarn" ;;
+  esac
+
+  case $PYTHON_CHOICE in
+    0) plan_line "Python: install via pyenv (version: $PYTHON_VERSION)" ;;
+    1) plan_line "Python: install directly" ;;
+    2) plan_line "Python: skip" ;;
+  esac
+
+  $WANT_GH_CLI && plan_line "GitHub CLI: install" || plan_line "GitHub CLI: skip"
+  $WANT_DOCKER && plan_line "Docker Desktop: install" || plan_line "Docker Desktop: skip"
+  $WANT_POSTMAN && plan_line "Postman: install" || plan_line "Postman: skip"
+  $WANT_CHROME && plan_line "Chrome: install" || plan_line "Chrome: skip"
+  $WANT_FIREFOX && plan_line "Firefox: install" || plan_line "Firefox: skip"
+  $WANT_JQ && plan_line "jq: install" || plan_line "jq: skip"
+  $WANT_STARSHIP && plan_line "Starship prompt: install" || plan_line "Starship prompt: skip"
+
+  local name email
+  name=$(git config --global user.name 2>/dev/null || true)
+  email=$(git config --global user.email 2>/dev/null || true)
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    plan_line "git config: already set ($name <$email>)"
+  else
+    plan_line "git config: prompt for user.name / user.email"
+  fi
+
+  if $GIT_SSH_SETUP; then
+    plan_line "SSH: generate key if needed, upload to GitHub via gh (terminal only)"
+  else
+    plan_line "SSH: skip"
+  fi
+
+  if $WANT_CLONE; then
+    local repo resolved
+    plan_line "Clone repo(s) into $CLONE_DIR:"
+    for repo in "${CLONE_REPOS[@]}"; do
+      resolved="$(resolve_repo_url "$repo")"
+      plan_line "  - $resolved"
+    done
+  else
+    plan_line "Clone repo(s): skip"
+  fi
+}
+
+gather_git_config_interactive() {
+  local name email
+  name=$(git config --global user.name 2>/dev/null || true)
+  email=$(git config --global user.email 2>/dev/null || true)
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    if $PROFILE_MODE; then return; fi
+    plan_line "git config: already set ($name <$email>)"
+    return
+  fi
+  if $PROFILE_MODE || ask_yesno "git user.name/email isn't fully set. Set it now?" "y"; then
+    GITCONFIG_NEEDED=true
+    [ -z "$name" ]  && name=$(ask_text "Your name for git commits")
+    [ -z "$email" ] && email=$(ask_text "Your email for git commits")
+    GITCONFIG_NAME="$name"
+    GITCONFIG_EMAIL="$email"
+    if ! $PROFILE_MODE; then
+      plan_line "git config: set user.name/email to $name <$email>"
+    fi
+  elif ! $PROFILE_MODE; then
+    plan_line "git config: leave as-is"
+  fi
+}
+
 # =============================================================================
 # Platform helpers
 # =============================================================================
@@ -521,15 +709,14 @@ gather_git_config() {
   fi
 }
 
-gather_ssh_key() {
-  if ask_yesno "Generate a new SSH key for GitHub/GitLab?" "n"; then
-    WANT_SSH_KEY=true
-    local default_email="$GITCONFIG_EMAIL"
-    [ -z "$default_email" ] && default_email=$(git config --global user.email 2>/dev/null || echo "")
-    SSH_EMAIL=$(ask_text "Email to associate with the key" "$default_email")
-    plan_line "SSH key: generate id_ed25519, copy public key to clipboard, offer to open GitHub"
+gather_ssh_setup() {
+  if $PROFILE_MODE; then return; fi
+  if ask_yesno "Set up SSH for GitHub (generate key + upload via gh, no browser)?" "n"; then
+    GIT_SSH_SETUP=true
+    WANT_GH_CLI=true
+    plan_line "SSH: generate key if needed, upload to GitHub via gh (terminal only)"
   else
-    plan_line "SSH key: skip"
+    plan_line "SSH: skip"
   fi
 }
 
@@ -830,28 +1017,89 @@ execute_git_config() {
   add_summary "git config" "OK" "-" "newly configured"
 }
 
-execute_ssh_key() {
-  if ! $WANT_SSH_KEY; then
-    add_summary "SSH key" "SKIPPED" "-" "user chose Skip"
+execute_gh_auth() {
+  if ! $GIT_SSH_SETUP; then return; fi
+  if ! has_cmd gh; then
+    fail "GitHub CLI (gh) is required for SSH setup but is not installed."
+    add_summary "GitHub auth" "FAILED" "-" "gh not installed"
     return
   fi
+  if gh auth status >/dev/null 2>&1; then
+    ok "gh already authenticated."
+    add_summary "GitHub auth" "OK" "-" "already authenticated"
+    return
+  fi
+  step "GitHub authentication..."
+  echo -e "  ${GRAY}Create a token at: https://github.com/settings/tokens${NC}"
+  echo -e "  ${GRAY}Scopes: repo, admin:public_key (or read:org + admin:public_key)${NC}"
+  local token=""
+  read -rs -p "  Paste GitHub token (hidden): " token
+  echo ""
+  if [ -z "$token" ]; then
+    fail "No token entered."
+    add_summary "GitHub auth" "FAILED" "-" "no token provided"
+    return
+  fi
+  if printf '%s' "$token" | gh auth login --with-token >/dev/null 2>&1; then
+    ok "GitHub authenticated."
+    add_summary "GitHub auth" "OK" "-" "authenticated via token"
+  else
+    fail "gh auth login failed."
+    add_summary "GitHub auth" "FAILED" "-" "gh auth login failed"
+  fi
+}
+
+execute_ssh_setup() {
+  if ! $GIT_SSH_SETUP; then
+    add_summary "SSH key" "SKIPPED" "-" "not requested"
+    return
+  fi
+  if ! has_cmd gh; then
+    add_summary "SSH key" "FAILED" "-" "gh not installed"
+    return
+  fi
+
+  execute_gh_auth
+  if ! gh auth status >/dev/null 2>&1; then
+    add_summary "SSH key" "FAILED" "-" "gh not authenticated"
+    return
+  fi
+
   step "SSH key..."
   local key_path="$HOME/.ssh/id_ed25519"
+  local email
+  email="${GITCONFIG_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
   if [ -f "$key_path" ]; then
     skip "SSH key already exists at $key_path -- not overwriting."
     add_summary "SSH key" "OK" "-" "already existed"
   else
     mkdir -p "$HOME/.ssh"
-    ssh-keygen -t ed25519 -C "$SSH_EMAIL" -f "$key_path" -N ""
-    ok "SSH key generated at $key_path"
-    add_summary "SSH key" "OK" "-" "newly generated"
-  fi
-  if [ -f "${key_path}.pub" ]; then
-    copy_to_clipboard "$(cat "${key_path}.pub")"
-    ok "Public key copied to clipboard."
-    if ask_yesno "Open GitHub's 'Add SSH key' page now?" "y"; then
-      open_url "https://github.com/settings/keys"
+    chmod 700 "$HOME/.ssh"
+    if ssh-keygen -t ed25519 -C "${email:-sherpa@$(hostname)}" -f "$key_path" -N ""; then
+      ok "SSH key generated at $key_path"
+      add_summary "SSH key" "OK" "-" "newly generated"
+    else
+      fail "SSH key generation failed."
+      add_summary "SSH key" "FAILED" "-" "ssh-keygen failed"
+      return
     fi
+  fi
+
+  if [ ! -f "${key_path}.pub" ]; then
+    fail "Public key not found at ${key_path}.pub"
+    add_summary "SSH upload" "FAILED" "-" "missing public key"
+    return
+  fi
+
+  step "Uploading SSH key to GitHub via gh..."
+  local title
+  title="$(hostname)-sherpa"
+  if gh ssh-key add "${key_path}.pub" -t "$title" >/dev/null 2>&1; then
+    ok "SSH key uploaded to GitHub."
+    add_summary "SSH upload" "OK" "-" "uploaded via gh"
+  else
+    fail "Could not upload SSH key (it may already be registered)."
+    add_summary "SSH upload" "FAILED" "-" "gh ssh-key add failed"
   fi
 }
 
@@ -862,19 +1110,36 @@ execute_clone_repos() {
   fi
   step "Cloning repo(s)..."
   mkdir -p "$CLONE_DIR"
-  local cloned=0 failed=0 url
-  IFS=',' read -ra urls <<< "$CLONE_URLS_RAW"
-  for url in "${urls[@]}"; do
-    url=$(echo "$url" | xargs)
-    [ -z "$url" ] && continue
-    if git clone "$url" "$CLONE_DIR/$(basename "$url" .git)"; then
-      ok "Cloned into $CLONE_DIR/$(basename "$url" .git)"
-      cloned=$((cloned + 1))
-    else
-      fail "Failed to clone $url"
-      failed=$((failed + 1))
-    fi
-  done
+  local cloned=0 failed=0 repo url dest name
+  if [ ${#CLONE_REPOS[@]} -gt 0 ]; then
+    for repo in "${CLONE_REPOS[@]}"; do
+      url="$(resolve_repo_url "$repo")"
+      name="$(basename "$url" .git)"
+      dest="$CLONE_DIR/$name"
+      if git clone "$url" "$dest"; then
+        ok "Cloned into $dest"
+        cloned=$((cloned + 1))
+      else
+        fail "Failed to clone $url"
+        failed=$((failed + 1))
+      fi
+    done
+  else
+    IFS=',' read -ra urls <<< "$CLONE_URLS_RAW"
+    for url in "${urls[@]}"; do
+      url=$(echo "$url" | xargs)
+      [ -z "$url" ] && continue
+      url="$(resolve_repo_url "$url")"
+      dest="$CLONE_DIR/$(basename "$url" .git)"
+      if git clone "$url" "$dest"; then
+        ok "Cloned into $dest"
+        cloned=$((cloned + 1))
+      else
+        fail "Failed to clone $url"
+        failed=$((failed + 1))
+      fi
+    done
+  fi
   if [ $failed -eq 0 ]; then
     add_summary "Clone repo(s)" "OK" "-" "$cloned cloned into $CLONE_DIR"
   else
@@ -887,22 +1152,30 @@ execute_clone_repos() {
 # =============================================================================
 
 main() {
+  parse_args "$@"
   banner
   detect_platform
   ensure_pkg_manager
 
-  echo -e "\nA few questions first -- nothing installs until you confirm the plan.\n"
-
-  gather_git
-  gather_ide
-  gather_node
-  gather_python
-  gather_extras
-  gather_git_config
-  gather_ssh_key
-  gather_clone_repos
-
-  print_plan_and_confirm
+  if $PROFILE_MODE; then
+    load_profile
+    echo -e "\nUsing profile: ${BOLD}$(basename "$PROFILE_FILE")${NC}"
+    echo -e "${GRAY}Review the plan below, then confirm to install.${NC}\n"
+    plan_from_profile
+    gather_git_config_interactive
+    print_plan_and_confirm
+  else
+    echo -e "\nA few questions first -- nothing installs until you confirm the plan.\n"
+    gather_git
+    gather_ide
+    gather_node
+    gather_python
+    gather_extras
+    gather_git_config
+    gather_ssh_setup
+    gather_clone_repos
+    print_plan_and_confirm
+  fi
 
   execute_git
   execute_ide
@@ -911,7 +1184,7 @@ main() {
   execute_python
   execute_extras
   execute_git_config
-  execute_ssh_key
+  execute_ssh_setup
   execute_clone_repos
 
   print_summary_table
@@ -927,4 +1200,4 @@ main() {
   echo ""
 }
 
-main
+main "$@"
