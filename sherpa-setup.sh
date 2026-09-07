@@ -367,28 +367,243 @@ resolve_repo_url() {
   fi
 }
 
+yaml_strip() {
+  # strip inline comments outside quotes, then trim, then outer quotes
+  local s="$1" out="" i=0 in_s=0 in_d=0 ch
+  while [ $i -lt ${#s} ]; do
+    ch="${s:$i:1}"
+    if [ "$ch" = '"' ] && [ $in_s -eq 0 ]; then
+      in_d=$((1 - in_d)); out+="$ch"
+    elif [ "$ch" = "'" ] && [ $in_d -eq 0 ]; then
+      in_s=$((1 - in_s)); out+="$ch"
+    elif [ "$ch" = "#" ] && [ $in_s -eq 0 ] && [ $in_d -eq 0 ]; then
+      break
+    else
+      out+="$ch"
+    fi
+    i=$((i + 1))
+  done
+  out="${out#"${out%%[![:space:]]*}"}"
+  out="${out%"${out##*[![:space:]]}"}"
+  if [[ "$out" == \"*\" && "$out" == *\" ]]; then
+    out="${out:1:${#out}-2}"
+  elif [[ "$out" == \'*\' && "$out" == *\' ]]; then
+    out="${out:1:${#out}-2}"
+  fi
+  printf '%s' "$out"
+}
+
+yaml_map_choice() {
+  local field="$1" value="$2"
+  case "$field:$value" in
+    node.manager:nvm) echo 0 ;;
+    node.manager:direct) echo 1 ;;
+    node.manager:skip) echo 2 ;;
+    python.manager:pyenv) echo 0 ;;
+    python.manager:direct) echo 1 ;;
+    python.manager:skip) echo 2 ;;
+    ide.choice:zed) echo 0 ;;
+    ide.choice:vscode) echo 1 ;;
+    ide.choice:both) echo 2 ;;
+    ide.choice:skip) echo 3 ;;
+    package_manager:npm) echo 0 ;;
+    package_manager:pnpm) echo 1 ;;
+    package_manager:yarn) echo 2 ;;
+    *)
+      echo -e "${RED}Invalid $field: $value${NC}" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Pure bash profile loader — no python required (blank laptop friendly).
 load_profile() {
-  local parser="$SCRIPT_DIR/sherpa-profile.py"
   if [ ! -f "$PROFILE_FILE" ]; then
     echo -e "${RED}Profile not found: $PROFILE_FILE${NC}"
     exit 1
   fi
-  if [ ! -f "$parser" ]; then
-    echo -e "${RED}Profile parser not found: $parser${NC}"
-    echo "Make sure sherpa-profile.py sits next to sherpa-setup.sh."
-    exit 1
+
+  PROFILE_MODE=true
+  PROFILE_NAME="$(basename "$PROFILE_FILE" .yml)"
+  PROFILE_NAME="${PROFILE_NAME%.yaml}"
+  NODE_CHOICE=2
+  NODE_VERSION="lts"
+  NODE_DEFAULT="lts"
+  NODE_VERSIONS=()
+  PYTHON_CHOICE=2
+  PYTHON_VERSION="3.12.4"
+  IDE_CHOICE=3
+  WANT_VSCODE_EXTENSIONS=false
+  PKG_MANAGER_CHOICE=0
+  WANT_GH_CLI=false
+  WANT_DOCKER=false
+  WANT_POSTMAN=false
+  WANT_CHROME=false
+  WANT_FIREFOX=false
+  WANT_JQ=false
+  WANT_STARSHIP=false
+  GIT_SSH_SETUP=false
+  WANT_CLONE=false
+  CLONE_DIR="$HOME/dev"
+  CLONE_REPOS=()
+
+  local section="" indent=0 line raw key value item choice
+  local git_protocol="ssh"
+  local versions_raw=""
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+    indent=0
+    while [[ "$line" =~ ^"  " ]]; do
+      indent=$((indent + 1))
+      line="${line:2}"
+    done
+    raw="$(yaml_strip "$line")"
+    [ -z "$raw" ] && continue
+
+    if [[ "$raw" == -* ]]; then
+      item="$(yaml_strip "${raw#-}")"
+      item="$(yaml_strip "$item")"
+      case "$section" in
+        extras)
+          case "$item" in
+            gh) WANT_GH_CLI=true ;;
+            docker) WANT_DOCKER=true ;;
+            postman) WANT_POSTMAN=true ;;
+            chrome) WANT_CHROME=true ;;
+            firefox) WANT_FIREFOX=true ;;
+            jq) WANT_JQ=true ;;
+            starship) WANT_STARSHIP=true ;;
+            *) echo -e "${RED}Unknown extra: $item${NC}"; exit 1 ;;
+          esac
+          ;;
+        git.clone.repos)
+          [ -n "$item" ] && CLONE_REPOS+=("$item")
+          ;;
+        node.versions)
+          [ -n "$item" ] && NODE_VERSIONS+=("$item")
+          ;;
+      esac
+      continue
+    fi
+
+    [[ "$raw" == *:* ]] || continue
+    key="${raw%%:*}"
+    value="$(yaml_strip "${raw#*:}")"
+    key="$(yaml_strip "$key")"
+
+    if [ $indent -eq 0 ]; then
+      section=""
+      case "$key" in
+        name) [ -n "$value" ] && PROFILE_NAME="$value" ;;
+        package_manager)
+          choice="$(yaml_map_choice package_manager "$value")" || exit 1
+          PKG_MANAGER_CHOICE=$choice
+          ;;
+        node|python|ide|extras|git) section="$key" ;;
+      esac
+      continue
+    fi
+
+    if [ $indent -eq 1 ]; then
+      case "$section:$key" in
+        node:manager)
+          choice="$(yaml_map_choice node.manager "$value")" || exit 1
+          NODE_CHOICE=$choice
+          ;;
+        node:version)
+          versions_raw="$value"
+          NODE_DEFAULT="$value"
+          ;;
+        node:versions)
+          versions_raw="$value"
+          ;;
+        node:default)
+          NODE_DEFAULT="$value"
+          ;;
+        python:manager)
+          choice="$(yaml_map_choice python.manager "$value")" || exit 1
+          PYTHON_CHOICE=$choice
+          ;;
+        python:version)
+          PYTHON_VERSION="$value"
+          ;;
+        ide:choice)
+          choice="$(yaml_map_choice ide.choice "$value")" || exit 1
+          IDE_CHOICE=$choice
+          ;;
+        ide:vscode_extensions)
+          case "$value" in true|True|yes|Yes) WANT_VSCODE_EXTENSIONS=true ;; *) WANT_VSCODE_EXTENSIONS=false ;; esac
+          ;;
+        git:protocol)
+          git_protocol="$value"
+          ;;
+        git:clone)
+          section="git.clone"
+          ;;
+        node:*) section="node.$key" ;;
+        git:*) section="git.$key" ;;
+      esac
+      # empty value after key: means nested block follows
+      if [ -z "$value" ]; then
+        case "$section:$key" in
+          *:versions) section="node.versions" ;;
+          git:clone) section="git.clone" ;;
+          *:extras) section="extras" ;;
+        esac
+      fi
+      continue
+    fi
+
+    if [ $indent -ge 2 ]; then
+      case "$section:$key" in
+        git.clone:dir) CLONE_DIR="$value" ;;
+        git.clone:repos) section="git.clone.repos" ;;
+      esac
+    fi
+  done < "$PROFILE_FILE"
+
+  # Resolve node versions from scalar / pipe / list
+  if [ ${#NODE_VERSIONS[@]} -eq 0 ] && [ -n "$versions_raw" ]; then
+    if [[ "$versions_raw" == *"|"* ]]; then
+      IFS='|' read -ra NODE_VERSIONS <<< "$versions_raw"
+      local i
+      for i in "${!NODE_VERSIONS[@]}"; do
+        NODE_VERSIONS[$i]="$(yaml_strip "${NODE_VERSIONS[$i]}")"
+      done
+    else
+      NODE_VERSIONS=("$versions_raw")
+    fi
   fi
-  if ! has_cmd python3; then
-    echo -e "${RED}python3 is required to read profile files.${NC}"
-    exit 1
+  if [ ${#NODE_VERSIONS[@]} -eq 0 ]; then
+    NODE_VERSIONS=("lts")
   fi
-  local parsed
-  if ! parsed="$(python3 "$parser" "$PROFILE_FILE" bash)"; then
-    echo -e "${RED}Failed to parse profile: $PROFILE_FILE${NC}"
-    exit 1
+  # drop empties
+  local cleaned=()
+  for item in "${NODE_VERSIONS[@]}"; do
+    [ -n "$item" ] && cleaned+=("$item")
+  done
+  NODE_VERSIONS=("${cleaned[@]}")
+  [ -z "$NODE_DEFAULT" ] && NODE_DEFAULT="${NODE_VERSIONS[$((${#NODE_VERSIONS[@]} - 1))]}"
+  NODE_VERSION="$NODE_DEFAULT"
+  local found=false
+  for item in "${NODE_VERSIONS[@]}"; do
+    [ "$item" = "$NODE_DEFAULT" ] && found=true
+  done
+  $found || NODE_VERSIONS+=("$NODE_DEFAULT")
+
+  case "$git_protocol" in
+    ssh|SSH) GIT_SSH_SETUP=true ;;
+    *) GIT_SSH_SETUP=false ;;
+  esac
+
+  if [ ${#CLONE_REPOS[@]} -gt 0 ]; then
+    WANT_CLONE=true
+    $GIT_SSH_SETUP && WANT_GH_CLI=true
   fi
-  # shellcheck disable=SC2086
-  eval "$parsed"
+
   CLONE_DIR="$(expand_home "$CLONE_DIR")"
 }
 

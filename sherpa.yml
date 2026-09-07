@@ -1,8 +1,10 @@
 # =============================================================================
 # Sherpa profile — FILL THIS IN, then zip with the scripts and share on Slack
 #
-# Teammate runs:
+# Teammate runs (macOS — only needs bash, no Python):
 #   ./sherpa-setup.sh --profile sherpa.yml
+#
+# Windows:
 #   .\sherpa-setup.ps1 -Profile sherpa.yml
 # =============================================================================
 

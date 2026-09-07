@@ -205,12 +205,21 @@ git:
 
 Zip these files and post to your internal `#eng-onboarding` channel:
 
+**macOS (no Python needed):**
+
 ```text
 onboarding.zip
-├── sherpa-setup.sh       # or sherpa-setup.ps1 on Windows
-├── sherpa-profile.py     # required parser (keep next to the script)
-├── sherpa.yml            # your team stack
-└── SETUP.txt             # optional: 3-line instructions
+├── sherpa-setup.sh
+└── sherpa.yml
+```
+
+**Windows:**
+
+```text
+onboarding.zip
+├── sherpa-setup.ps1
+├── sherpa-profile.py     # still used on Windows for now
+└── sherpa.yml
 ```
 
 New hire:
