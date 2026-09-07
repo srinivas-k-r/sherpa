@@ -1,0 +1,60 @@
+# =============================================================================
+# Sherpa profile — FILL THIS IN, then zip with the scripts and share on Slack
+#
+# Teammate runs (macOS — only needs bash, no Python):
+#   ./sherpa-setup.sh --profile sherpa.yml
+#
+# Windows:
+#   .\sherpa-setup.ps1 -Profile sherpa.yml
+# =============================================================================
+
+version: 1
+name: YOUR_TEAM_NAME
+
+# --- Node.js -----------------------------------------------------------------
+node:
+  manager: nvm              # nvm | direct | skip
+  # One version:
+  #   versions: "22"
+  # Multiple versions (pipe OR list — both work):
+  versions: "18|20|22"
+  # versions:
+  #   - "18"
+  #   - "20"
+  #   - "22"
+  default: "22"             # which version `nvm use` / default alias points at
+
+# --- Python ------------------------------------------------------------------
+python:
+  manager: skip             # pyenv | direct | skip
+  version: "3.12.4"
+
+# --- Package manager (needs Node) --------------------------------------------
+package_manager: pnpm       # npm | pnpm | yarn
+
+# --- IDE ---------------------------------------------------------------------
+ide:
+  choice: skip              # zed | vscode | both | skip
+  vscode_extensions: true   # only used if vscode or both
+
+# --- Optional tools (delete lines you don't want) ----------------------------
+extras:
+  - gh                      # required for SSH key upload + GitHub
+  - jq
+  # - docker
+  # - postman
+  # - chrome
+  # - firefox
+  # - starship
+
+# --- Git / SSH / clone -------------------------------------------------------
+git:
+  protocol: ssh             # ssh (recommended) — uploads key via gh, no browser
+  clone:
+    dir: ~/dev              # parent folder for clones
+    repos:
+      # shorthand → git@github.com:org/repo.git
+      - YOUR_ORG/YOUR_REPO
+      # - YOUR_ORG/ANOTHER_REPO
+      # or full URL:
+      # - git@github.com:YOUR_ORG/YOUR_REPO.git

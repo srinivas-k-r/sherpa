@@ -36,11 +36,23 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # =============================================================================
 # Config & globals
 # =============================================================================
 
 PLATFORM=""   # "mac" | "windows"
+
+PROFILE_FILE=""
+PROFILE_MODE=false
+PROFILE_NAME=""
+NODE_VERSION="lts"
+NODE_DEFAULT="lts"
+NODE_VERSIONS=("lts")
+PYTHON_VERSION="3.12.4"
+GIT_SSH_SETUP=false
+CLONE_REPOS=()
 
 # --- Answers collected during GATHER, consumed during EXECUTE ---
 GIT_ALREADY_INSTALLED=false
@@ -65,9 +77,6 @@ WANT_STARSHIP=false
 GITCONFIG_NEEDED=false
 GITCONFIG_NAME=""
 GITCONFIG_EMAIL=""
-
-WANT_SSH_KEY=false
-SSH_EMAIL=""
 
 WANT_CLONE=false
 CLONE_URLS_RAW=""
@@ -302,6 +311,406 @@ cleanup_on_interrupt() {
 trap cleanup_on_interrupt INT
 trap 'tput cnorm 2>/dev/null || true' EXIT
 
+usage() {
+  cat <<'EOF'
+Usage: sherpa-setup.sh [options]
+
+Options:
+  --profile <file>   Read stack from a sherpa.yml profile (skips the wizard)
+  -h, --help         Show this help
+
+Examples:
+  ./sherpa-setup.sh
+  ./sherpa-setup.sh --profile sherpa.yml
+  ./sherpa-setup.sh --profile ./team-bundle/sherpa.yml
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile)
+        [ $# -ge 2 ] || { echo -e "${RED}--profile requires a file path.${NC}"; exit 1; }
+        PROFILE_FILE="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo -e "${RED}Unknown option: $1${NC}"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+expand_home() {
+  local path="$1"
+  case "$path" in
+    "~") echo "$HOME" ;;
+    "~/"*) echo "$HOME/${path#~/}" ;;
+    *) echo "$path" ;;
+  esac
+}
+
+resolve_repo_url() {
+  local repo="$1"
+  if [[ "$repo" == git@* ]] || [[ "$repo" == https://* ]] || [[ "$repo" == http://* ]]; then
+    echo "$repo"
+  elif [[ "$repo" == */* ]]; then
+    echo "git@github.com:${repo}.git"
+  else
+    echo "$repo"
+  fi
+}
+
+yaml_strip() {
+  # strip inline comments outside quotes, then trim, then outer quotes
+  local s="$1" out="" i=0 in_s=0 in_d=0 ch
+  while [ $i -lt ${#s} ]; do
+    ch="${s:$i:1}"
+    if [ "$ch" = '"' ] && [ $in_s -eq 0 ]; then
+      in_d=$((1 - in_d)); out+="$ch"
+    elif [ "$ch" = "'" ] && [ $in_d -eq 0 ]; then
+      in_s=$((1 - in_s)); out+="$ch"
+    elif [ "$ch" = "#" ] && [ $in_s -eq 0 ] && [ $in_d -eq 0 ]; then
+      break
+    else
+      out+="$ch"
+    fi
+    i=$((i + 1))
+  done
+  out="${out#"${out%%[![:space:]]*}"}"
+  out="${out%"${out##*[![:space:]]}"}"
+  if [[ "$out" == \"*\" && "$out" == *\" ]]; then
+    out="${out:1:${#out}-2}"
+  elif [[ "$out" == \'*\' && "$out" == *\' ]]; then
+    out="${out:1:${#out}-2}"
+  fi
+  printf '%s' "$out"
+}
+
+yaml_map_choice() {
+  local field="$1" value="$2"
+  case "$field:$value" in
+    node.manager:nvm) echo 0 ;;
+    node.manager:direct) echo 1 ;;
+    node.manager:skip) echo 2 ;;
+    python.manager:pyenv) echo 0 ;;
+    python.manager:direct) echo 1 ;;
+    python.manager:skip) echo 2 ;;
+    ide.choice:zed) echo 0 ;;
+    ide.choice:vscode) echo 1 ;;
+    ide.choice:both) echo 2 ;;
+    ide.choice:skip) echo 3 ;;
+    package_manager:npm) echo 0 ;;
+    package_manager:pnpm) echo 1 ;;
+    package_manager:yarn) echo 2 ;;
+    *)
+      echo -e "${RED}Invalid $field: $value${NC}" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Pure bash profile loader — no python required (blank laptop friendly).
+load_profile() {
+  if [ ! -f "$PROFILE_FILE" ]; then
+    echo -e "${RED}Profile not found: $PROFILE_FILE${NC}"
+    exit 1
+  fi
+
+  PROFILE_MODE=true
+  PROFILE_NAME="$(basename "$PROFILE_FILE" .yml)"
+  PROFILE_NAME="${PROFILE_NAME%.yaml}"
+  NODE_CHOICE=2
+  NODE_VERSION="lts"
+  NODE_DEFAULT="lts"
+  NODE_VERSIONS=()
+  PYTHON_CHOICE=2
+  PYTHON_VERSION="3.12.4"
+  IDE_CHOICE=3
+  WANT_VSCODE_EXTENSIONS=false
+  PKG_MANAGER_CHOICE=0
+  WANT_GH_CLI=false
+  WANT_DOCKER=false
+  WANT_POSTMAN=false
+  WANT_CHROME=false
+  WANT_FIREFOX=false
+  WANT_JQ=false
+  WANT_STARSHIP=false
+  GIT_SSH_SETUP=false
+  WANT_CLONE=false
+  CLONE_DIR="$HOME/dev"
+  CLONE_REPOS=()
+
+  local section="" indent=0 line raw key value item choice
+  local git_protocol="ssh"
+  local versions_raw=""
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+    indent=0
+    while [[ "$line" =~ ^"  " ]]; do
+      indent=$((indent + 1))
+      line="${line:2}"
+    done
+    raw="$(yaml_strip "$line")"
+    [ -z "$raw" ] && continue
+
+    if [[ "$raw" == -* ]]; then
+      item="$(yaml_strip "${raw#-}")"
+      item="$(yaml_strip "$item")"
+      case "$section" in
+        extras)
+          case "$item" in
+            gh) WANT_GH_CLI=true ;;
+            docker) WANT_DOCKER=true ;;
+            postman) WANT_POSTMAN=true ;;
+            chrome) WANT_CHROME=true ;;
+            firefox) WANT_FIREFOX=true ;;
+            jq) WANT_JQ=true ;;
+            starship) WANT_STARSHIP=true ;;
+            *) echo -e "${RED}Unknown extra: $item${NC}"; exit 1 ;;
+          esac
+          ;;
+        git.clone.repos)
+          [ -n "$item" ] && CLONE_REPOS+=("$item")
+          ;;
+        node.versions)
+          [ -n "$item" ] && NODE_VERSIONS+=("$item")
+          ;;
+      esac
+      continue
+    fi
+
+    [[ "$raw" == *:* ]] || continue
+    key="${raw%%:*}"
+    value="$(yaml_strip "${raw#*:}")"
+    key="$(yaml_strip "$key")"
+
+    if [ $indent -eq 0 ]; then
+      section=""
+      case "$key" in
+        name) [ -n "$value" ] && PROFILE_NAME="$value" ;;
+        package_manager)
+          choice="$(yaml_map_choice package_manager "$value")" || exit 1
+          PKG_MANAGER_CHOICE=$choice
+          ;;
+        node|python|ide|extras|git) section="$key" ;;
+      esac
+      continue
+    fi
+
+    if [ $indent -eq 1 ]; then
+      case "$section:$key" in
+        node:manager)
+          choice="$(yaml_map_choice node.manager "$value")" || exit 1
+          NODE_CHOICE=$choice
+          ;;
+        node:version)
+          versions_raw="$value"
+          NODE_DEFAULT="$value"
+          ;;
+        node:versions)
+          versions_raw="$value"
+          ;;
+        node:default)
+          NODE_DEFAULT="$value"
+          ;;
+        python:manager)
+          choice="$(yaml_map_choice python.manager "$value")" || exit 1
+          PYTHON_CHOICE=$choice
+          ;;
+        python:version)
+          PYTHON_VERSION="$value"
+          ;;
+        ide:choice)
+          choice="$(yaml_map_choice ide.choice "$value")" || exit 1
+          IDE_CHOICE=$choice
+          ;;
+        ide:vscode_extensions)
+          case "$value" in true|True|yes|Yes) WANT_VSCODE_EXTENSIONS=true ;; *) WANT_VSCODE_EXTENSIONS=false ;; esac
+          ;;
+        git:protocol)
+          git_protocol="$value"
+          ;;
+        git:clone)
+          section="git.clone"
+          ;;
+        node:*) section="node.$key" ;;
+        git:*) section="git.$key" ;;
+      esac
+      # empty value after key: means nested block follows
+      if [ -z "$value" ]; then
+        case "$section:$key" in
+          *:versions) section="node.versions" ;;
+          git:clone) section="git.clone" ;;
+          *:extras) section="extras" ;;
+        esac
+      fi
+      continue
+    fi
+
+    if [ $indent -ge 2 ]; then
+      case "$section:$key" in
+        git.clone:dir) CLONE_DIR="$value" ;;
+        git.clone:repos) section="git.clone.repos" ;;
+      esac
+    fi
+  done < "$PROFILE_FILE"
+
+  # Resolve node versions from scalar / pipe / list
+  if [ ${#NODE_VERSIONS[@]} -eq 0 ] && [ -n "$versions_raw" ]; then
+    if [[ "$versions_raw" == *"|"* ]]; then
+      IFS='|' read -ra NODE_VERSIONS <<< "$versions_raw"
+      local i
+      for i in "${!NODE_VERSIONS[@]}"; do
+        NODE_VERSIONS[$i]="$(yaml_strip "${NODE_VERSIONS[$i]}")"
+      done
+    else
+      NODE_VERSIONS=("$versions_raw")
+    fi
+  fi
+  if [ ${#NODE_VERSIONS[@]} -eq 0 ]; then
+    NODE_VERSIONS=("lts")
+  fi
+  # drop empties
+  local cleaned=()
+  for item in "${NODE_VERSIONS[@]}"; do
+    [ -n "$item" ] && cleaned+=("$item")
+  done
+  NODE_VERSIONS=("${cleaned[@]}")
+  [ -z "$NODE_DEFAULT" ] && NODE_DEFAULT="${NODE_VERSIONS[$((${#NODE_VERSIONS[@]} - 1))]}"
+  NODE_VERSION="$NODE_DEFAULT"
+  local found=false
+  for item in "${NODE_VERSIONS[@]}"; do
+    [ "$item" = "$NODE_DEFAULT" ] && found=true
+  done
+  $found || NODE_VERSIONS+=("$NODE_DEFAULT")
+
+  case "$git_protocol" in
+    ssh|SSH) GIT_SSH_SETUP=true ;;
+    *) GIT_SSH_SETUP=false ;;
+  esac
+
+  if [ ${#CLONE_REPOS[@]} -gt 0 ]; then
+    WANT_CLONE=true
+    $GIT_SSH_SETUP && WANT_GH_CLI=true
+  fi
+
+  CLONE_DIR="$(expand_home "$CLONE_DIR")"
+}
+
+plan_from_profile() {
+  plan_line "Profile: $PROFILE_NAME (from $(basename "$PROFILE_FILE"))"
+
+  if has_cmd git; then
+    GIT_ALREADY_INSTALLED=true
+    plan_line "Git: already installed ($(git --version | awk '{print $3}'))"
+  else
+    GIT_WANT_INSTALL=true
+    plan_line "Git: install"
+  fi
+
+  case $IDE_CHOICE in
+    0) plan_line "IDE: install Zed" ;;
+    1) plan_line "IDE: install VS Code" ;;
+    2) plan_line "IDE: install Zed and VS Code" ;;
+    3) plan_line "IDE: skip" ;;
+  esac
+  if [ "$IDE_CHOICE" -eq 1 ] || [ "$IDE_CHOICE" -eq 2 ]; then
+    if $WANT_VSCODE_EXTENSIONS; then
+      plan_line "VS Code extensions: install Prettier, ESLint, GitLens"
+    else
+      plan_line "VS Code extensions: skip"
+    fi
+  fi
+
+  case $NODE_CHOICE in
+    0)
+      local joined
+      joined=$(IFS=', '; echo "${NODE_VERSIONS[*]}")
+      plan_line "Node.js: install via nvm (versions: $joined; default: $NODE_DEFAULT)"
+      ;;
+    1) plan_line "Node.js: install LTS directly" ;;
+    2) plan_line "Node.js: skip" ;;
+  esac
+  case $PKG_MANAGER_CHOICE in
+    0) plan_line "Package manager: npm" ;;
+    1) plan_line "Package manager: pnpm" ;;
+    2) plan_line "Package manager: yarn" ;;
+  esac
+
+  case $PYTHON_CHOICE in
+    0) plan_line "Python: install via pyenv (version: $PYTHON_VERSION)" ;;
+    1) plan_line "Python: install directly" ;;
+    2) plan_line "Python: skip" ;;
+  esac
+
+  $WANT_GH_CLI && plan_line "GitHub CLI: install" || plan_line "GitHub CLI: skip"
+  $WANT_DOCKER && plan_line "Docker Desktop: install" || plan_line "Docker Desktop: skip"
+  $WANT_POSTMAN && plan_line "Postman: install" || plan_line "Postman: skip"
+  $WANT_CHROME && plan_line "Chrome: install" || plan_line "Chrome: skip"
+  $WANT_FIREFOX && plan_line "Firefox: install" || plan_line "Firefox: skip"
+  $WANT_JQ && plan_line "jq: install" || plan_line "jq: skip"
+  $WANT_STARSHIP && plan_line "Starship prompt: install" || plan_line "Starship prompt: skip"
+
+  local name email
+  name=$(git config --global user.name 2>/dev/null || true)
+  email=$(git config --global user.email 2>/dev/null || true)
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    plan_line "git config: already set ($name <$email>)"
+  else
+    plan_line "git config: prompt for user.name / user.email"
+  fi
+
+  if $GIT_SSH_SETUP; then
+    plan_line "SSH: generate key if needed, upload to GitHub via gh (terminal only)"
+  else
+    plan_line "SSH: skip"
+  fi
+
+  if $WANT_CLONE; then
+    local repo resolved
+    plan_line "Clone repo(s) into $CLONE_DIR:"
+    for repo in "${CLONE_REPOS[@]}"; do
+      resolved="$(resolve_repo_url "$repo")"
+      plan_line "  - $resolved"
+    done
+  else
+    plan_line "Clone repo(s): skip"
+  fi
+}
+
+gather_git_config_interactive() {
+  local name email
+  name=$(git config --global user.name 2>/dev/null || true)
+  email=$(git config --global user.email 2>/dev/null || true)
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    if $PROFILE_MODE; then return; fi
+    plan_line "git config: already set ($name <$email>)"
+    return
+  fi
+  if $PROFILE_MODE || ask_yesno "git user.name/email isn't fully set. Set it now?" "y"; then
+    GITCONFIG_NEEDED=true
+    [ -z "$name" ]  && name=$(ask_text "Your name for git commits")
+    [ -z "$email" ] && email=$(ask_text "Your email for git commits")
+    GITCONFIG_NAME="$name"
+    GITCONFIG_EMAIL="$email"
+    if ! $PROFILE_MODE; then
+      plan_line "git config: set user.name/email to $name <$email>"
+    fi
+  elif ! $PROFILE_MODE; then
+    plan_line "git config: leave as-is"
+  fi
+}
+
 # =============================================================================
 # Platform helpers
 # =============================================================================
@@ -521,15 +930,14 @@ gather_git_config() {
   fi
 }
 
-gather_ssh_key() {
-  if ask_yesno "Generate a new SSH key for GitHub/GitLab?" "n"; then
-    WANT_SSH_KEY=true
-    local default_email="$GITCONFIG_EMAIL"
-    [ -z "$default_email" ] && default_email=$(git config --global user.email 2>/dev/null || echo "")
-    SSH_EMAIL=$(ask_text "Email to associate with the key" "$default_email")
-    plan_line "SSH key: generate id_ed25519, copy public key to clipboard, offer to open GitHub"
+gather_ssh_setup() {
+  if $PROFILE_MODE; then return; fi
+  if ask_yesno "Set up SSH for GitHub (generate key + upload via gh, no browser)?" "n"; then
+    GIT_SSH_SETUP=true
+    WANT_GH_CLI=true
+    plan_line "SSH: generate key if needed, upload to GitHub via gh (terminal only)"
   else
-    plan_line "SSH key: skip"
+    plan_line "SSH: skip"
   fi
 }
 
@@ -631,24 +1039,30 @@ execute_node() {
   case $NODE_CHOICE in
     0)
       step "nvm..."
+      local nvm_ok=false
       if [ "$PLATFORM" = "mac" ]; then
         if [ -d "$HOME/.nvm" ] || has_cmd nvm; then
           skip "nvm already installed."; add_summary "nvm" "OK" "-" "already installed"
+          nvm_ok=true
         elif curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash; then
           ok "nvm installed."; add_summary "nvm" "OK" "-" "newly installed"
-          NEXT_STEPS+=("Open a new terminal (or 'source ~/.zshrc'), then: nvm install --lts && nvm use --lts")
+          nvm_ok=true
         else
           fail "nvm install failed."; add_summary "nvm" "FAILED" "-" "install command failed"
         fi
       else
         if has_cmd nvm; then
           skip "nvm-windows already installed."; add_summary "nvm-windows" "OK" "-" "already installed"
+          nvm_ok=true
         elif install_pkg "" "CoreyButler.NVMforWindows"; then
           ok "nvm-windows installed."; add_summary "nvm-windows" "OK" "-" "newly installed"
-          NEXT_STEPS+=("Open a NEW terminal, then: nvm install lts && nvm use lts")
+          nvm_ok=true
         else
           fail "nvm-windows install failed."; add_summary "nvm-windows" "FAILED" "-" "install command failed"
         fi
+      fi
+      if $nvm_ok; then
+        install_node_versions_via_nvm
       fi
       ;;
     1)
@@ -661,6 +1075,72 @@ execute_node() {
       ;;
     2) add_summary "Node.js" "SKIPPED" "-" "user chose Skip" ;;
   esac
+}
+
+# Load nvm into the current shell (mac). nvm-windows is a different binary.
+load_nvm() {
+  if [ "$PLATFORM" = "mac" ]; then
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+  fi
+  has_cmd nvm || type nvm >/dev/null 2>&1
+}
+
+nvm_install_one() {
+  local ver="$1"
+  if [ "$ver" = "lts" ]; then
+    if [ "$PLATFORM" = "mac" ]; then
+      nvm install --lts
+    else
+      nvm install lts
+    fi
+  else
+    nvm install "$ver"
+  fi
+}
+
+install_node_versions_via_nvm() {
+  step "Node.js versions via nvm..."
+  if ! load_nvm; then
+    skip "nvm not available in this shell yet — reopen terminal, then install versions."
+    add_summary "Node versions" "SKIPPED" "-" "nvm not in PATH yet"
+    local cmds=""
+    local ver
+    for ver in "${NODE_VERSIONS[@]}"; do
+      cmds+="nvm install $ver; "
+    done
+    if [ "$PLATFORM" = "mac" ]; then
+      NEXT_STEPS+=("Open a new terminal (or 'source ~/.nvm/nvm.sh'), then: ${cmds}nvm alias default $NODE_DEFAULT && nvm use $NODE_DEFAULT")
+    else
+      NEXT_STEPS+=("Open a NEW terminal, then: ${cmds}nvm use $NODE_DEFAULT")
+    fi
+    return
+  fi
+
+  local ver installed=0 failed=0
+  for ver in "${NODE_VERSIONS[@]}"; do
+    if nvm_install_one "$ver"; then
+      ok "Node $ver installed."
+      installed=$((installed + 1))
+    else
+      fail "Node $ver install failed."
+      failed=$((failed + 1))
+    fi
+  done
+
+  if [ "$PLATFORM" = "mac" ]; then
+    nvm alias default "$NODE_DEFAULT" >/dev/null 2>&1 || true
+    nvm use "$NODE_DEFAULT" >/dev/null 2>&1 || true
+  else
+    nvm use "$NODE_DEFAULT" >/dev/null 2>&1 || true
+  fi
+
+  if [ $failed -eq 0 ]; then
+    add_summary "Node versions" "OK" "$NODE_DEFAULT" "installed: ${NODE_VERSIONS[*]} (default $NODE_DEFAULT)"
+  else
+    add_summary "Node versions" "FAILED" "-" "$installed OK, $failed failed"
+  fi
 }
 
 # execute_package_manager -- npm needs nothing extra (it ships with Node).
@@ -830,28 +1310,89 @@ execute_git_config() {
   add_summary "git config" "OK" "-" "newly configured"
 }
 
-execute_ssh_key() {
-  if ! $WANT_SSH_KEY; then
-    add_summary "SSH key" "SKIPPED" "-" "user chose Skip"
+execute_gh_auth() {
+  if ! $GIT_SSH_SETUP; then return; fi
+  if ! has_cmd gh; then
+    fail "GitHub CLI (gh) is required for SSH setup but is not installed."
+    add_summary "GitHub auth" "FAILED" "-" "gh not installed"
     return
   fi
+  if gh auth status >/dev/null 2>&1; then
+    ok "gh already authenticated."
+    add_summary "GitHub auth" "OK" "-" "already authenticated"
+    return
+  fi
+  step "GitHub authentication..."
+  echo -e "  ${GRAY}Create a token at: https://github.com/settings/tokens${NC}"
+  echo -e "  ${GRAY}Scopes: repo, admin:public_key (or read:org + admin:public_key)${NC}"
+  local token=""
+  read -rs -p "  Paste GitHub token (hidden): " token
+  echo ""
+  if [ -z "$token" ]; then
+    fail "No token entered."
+    add_summary "GitHub auth" "FAILED" "-" "no token provided"
+    return
+  fi
+  if printf '%s' "$token" | gh auth login --with-token >/dev/null 2>&1; then
+    ok "GitHub authenticated."
+    add_summary "GitHub auth" "OK" "-" "authenticated via token"
+  else
+    fail "gh auth login failed."
+    add_summary "GitHub auth" "FAILED" "-" "gh auth login failed"
+  fi
+}
+
+execute_ssh_setup() {
+  if ! $GIT_SSH_SETUP; then
+    add_summary "SSH key" "SKIPPED" "-" "not requested"
+    return
+  fi
+  if ! has_cmd gh; then
+    add_summary "SSH key" "FAILED" "-" "gh not installed"
+    return
+  fi
+
+  execute_gh_auth
+  if ! gh auth status >/dev/null 2>&1; then
+    add_summary "SSH key" "FAILED" "-" "gh not authenticated"
+    return
+  fi
+
   step "SSH key..."
   local key_path="$HOME/.ssh/id_ed25519"
+  local email
+  email="${GITCONFIG_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
   if [ -f "$key_path" ]; then
     skip "SSH key already exists at $key_path -- not overwriting."
     add_summary "SSH key" "OK" "-" "already existed"
   else
     mkdir -p "$HOME/.ssh"
-    ssh-keygen -t ed25519 -C "$SSH_EMAIL" -f "$key_path" -N ""
-    ok "SSH key generated at $key_path"
-    add_summary "SSH key" "OK" "-" "newly generated"
-  fi
-  if [ -f "${key_path}.pub" ]; then
-    copy_to_clipboard "$(cat "${key_path}.pub")"
-    ok "Public key copied to clipboard."
-    if ask_yesno "Open GitHub's 'Add SSH key' page now?" "y"; then
-      open_url "https://github.com/settings/keys"
+    chmod 700 "$HOME/.ssh"
+    if ssh-keygen -t ed25519 -C "${email:-sherpa@$(hostname)}" -f "$key_path" -N ""; then
+      ok "SSH key generated at $key_path"
+      add_summary "SSH key" "OK" "-" "newly generated"
+    else
+      fail "SSH key generation failed."
+      add_summary "SSH key" "FAILED" "-" "ssh-keygen failed"
+      return
     fi
+  fi
+
+  if [ ! -f "${key_path}.pub" ]; then
+    fail "Public key not found at ${key_path}.pub"
+    add_summary "SSH upload" "FAILED" "-" "missing public key"
+    return
+  fi
+
+  step "Uploading SSH key to GitHub via gh..."
+  local title
+  title="$(hostname)-sherpa"
+  if gh ssh-key add "${key_path}.pub" -t "$title" >/dev/null 2>&1; then
+    ok "SSH key uploaded to GitHub."
+    add_summary "SSH upload" "OK" "-" "uploaded via gh"
+  else
+    fail "Could not upload SSH key (it may already be registered)."
+    add_summary "SSH upload" "FAILED" "-" "gh ssh-key add failed"
   fi
 }
 
@@ -862,19 +1403,36 @@ execute_clone_repos() {
   fi
   step "Cloning repo(s)..."
   mkdir -p "$CLONE_DIR"
-  local cloned=0 failed=0 url
-  IFS=',' read -ra urls <<< "$CLONE_URLS_RAW"
-  for url in "${urls[@]}"; do
-    url=$(echo "$url" | xargs)
-    [ -z "$url" ] && continue
-    if git clone "$url" "$CLONE_DIR/$(basename "$url" .git)"; then
-      ok "Cloned into $CLONE_DIR/$(basename "$url" .git)"
-      cloned=$((cloned + 1))
-    else
-      fail "Failed to clone $url"
-      failed=$((failed + 1))
-    fi
-  done
+  local cloned=0 failed=0 repo url dest name
+  if [ ${#CLONE_REPOS[@]} -gt 0 ]; then
+    for repo in "${CLONE_REPOS[@]}"; do
+      url="$(resolve_repo_url "$repo")"
+      name="$(basename "$url" .git)"
+      dest="$CLONE_DIR/$name"
+      if git clone "$url" "$dest"; then
+        ok "Cloned into $dest"
+        cloned=$((cloned + 1))
+      else
+        fail "Failed to clone $url"
+        failed=$((failed + 1))
+      fi
+    done
+  else
+    IFS=',' read -ra urls <<< "$CLONE_URLS_RAW"
+    for url in "${urls[@]}"; do
+      url=$(echo "$url" | xargs)
+      [ -z "$url" ] && continue
+      url="$(resolve_repo_url "$url")"
+      dest="$CLONE_DIR/$(basename "$url" .git)"
+      if git clone "$url" "$dest"; then
+        ok "Cloned into $dest"
+        cloned=$((cloned + 1))
+      else
+        fail "Failed to clone $url"
+        failed=$((failed + 1))
+      fi
+    done
+  fi
   if [ $failed -eq 0 ]; then
     add_summary "Clone repo(s)" "OK" "-" "$cloned cloned into $CLONE_DIR"
   else
@@ -887,22 +1445,30 @@ execute_clone_repos() {
 # =============================================================================
 
 main() {
+  parse_args "$@"
   banner
   detect_platform
   ensure_pkg_manager
 
-  echo -e "\nA few questions first -- nothing installs until you confirm the plan.\n"
-
-  gather_git
-  gather_ide
-  gather_node
-  gather_python
-  gather_extras
-  gather_git_config
-  gather_ssh_key
-  gather_clone_repos
-
-  print_plan_and_confirm
+  if $PROFILE_MODE; then
+    load_profile
+    echo -e "\nUsing profile: ${BOLD}$(basename "$PROFILE_FILE")${NC}"
+    echo -e "${GRAY}Review the plan below, then confirm to install.${NC}\n"
+    plan_from_profile
+    gather_git_config_interactive
+    print_plan_and_confirm
+  else
+    echo -e "\nA few questions first -- nothing installs until you confirm the plan.\n"
+    gather_git
+    gather_ide
+    gather_node
+    gather_python
+    gather_extras
+    gather_git_config
+    gather_ssh_setup
+    gather_clone_repos
+    print_plan_and_confirm
+  fi
 
   execute_git
   execute_ide
@@ -911,7 +1477,7 @@ main() {
   execute_python
   execute_extras
   execute_git_config
-  execute_ssh_key
+  execute_ssh_setup
   execute_clone_repos
 
   print_summary_table
@@ -927,4 +1493,4 @@ main() {
   echo ""
 }
 
-main
+main "$@"

@@ -112,10 +112,16 @@ Make the script executable:
 chmod +x sherpa-setup.sh
 ```
 
-Run it:
+Run interactively:
 
 ```bash
 ./sherpa-setup.sh
+```
+
+Or apply a profile file (team / personal stack):
+
+```bash
+./sherpa-setup.sh --profile sherpa.yml
 ```
 
 ---
@@ -136,6 +142,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\sherpa-setup.ps1
 ```
 
+Or apply a profile:
+
+```powershell
+.\sherpa-setup.ps1 -Profile sherpa.yml
+```
+
 The execution-policy change only applies to the current PowerShell process.
 
 ---
@@ -149,6 +161,85 @@ git clone <YOUR_REPOSITORY_URL>
 cd sherpa
 ./sherpa-setup.sh
 ```
+
+---
+
+## 📄 Profile files (`sherpa.yml`)
+
+Instead of answering the wizard every time, you can share a **profile file** that describes the stack to install.
+
+```bash
+./sherpa-setup.sh --profile sherpa.yml
+```
+
+Sherpa reads the file, prints a plan, asks for confirmation, then installs. You still get prompted for personal details (git name/email, GitHub token for SSH) — those never belong in a shared file.
+
+### Example profile
+
+See [`sherpa.yml`](sherpa.yml) in this repo. A minimal team profile looks like:
+
+```yaml
+version: 1
+name: acme-frontend
+
+node:
+  manager: nvm
+  versions: "18|20|22"   # pipe, YAML list, or single "22"
+  default: "22"
+
+package_manager: pnpm
+
+extras:
+  - gh
+  - jq
+
+git:
+  protocol: ssh
+  clone:
+    dir: ~/dev
+    repos:
+      - acme/web        # → git@github.com:acme/web.git
+```
+
+### Sharing via Slack (no git repo required)
+
+Zip these files and post to your internal `#eng-onboarding` channel:
+
+**macOS (no Python needed):**
+
+```text
+onboarding.zip
+├── sherpa-setup.sh
+└── sherpa.yml
+```
+
+**Windows:**
+
+```text
+onboarding.zip
+├── sherpa-setup.ps1
+├── sherpa-profile.py     # still used on Windows for now
+└── sherpa.yml
+```
+
+New hire:
+
+```bash
+unzip onboarding.zip && cd onboarding
+./sherpa-setup.sh --profile sherpa.yml
+```
+
+Later, when the team is ready, move `sherpa.yml` into a git repo — same file, better delivery.
+
+### SSH setup (terminal only)
+
+When `git.protocol: ssh` is set (or repos are listed), Sherpa:
+
+1. Installs `gh` if listed in `extras` (auto-enabled when cloning via SSH)
+2. Prompts for a GitHub token in the terminal
+3. Generates an SSH key if needed
+4. Uploads it with `gh ssh-key add` — no browser, no clipboard
+5. Clones repos via `git@github.com:...`
 
 ---
 
@@ -281,20 +372,18 @@ Sherpa can also install:
 
 ## 🔐 Git & SSH Setup
 
-Sherpa can optionally configure:
+Sherpa can configure:
 
 ```bash
 git config --global user.name
 git config --global user.email
 ```
 
-It can also generate an Ed25519 SSH key:
+For SSH (interactive mode or profiles with `git.protocol: ssh`):
 
-```text
-~/.ssh/id_ed25519
-```
-
-The public key is copied to your clipboard, and Sherpa can optionally open GitHub's SSH-key settings page.
+1. Authenticate `gh` with a token pasted in the terminal
+2. Generate an Ed25519 key at `~/.ssh/id_ed25519` (if missing)
+3. Upload the public key with `gh ssh-key add`
 
 Sherpa will **not overwrite an existing `id_ed25519` key**.
 
@@ -400,6 +489,8 @@ Pressing `Ctrl+C` during the main Gather/Plan flow stops Sherpa without proceedi
 ```text
 .
 ├── README.md
+├── sherpa.yml            # example profile
+├── sherpa-profile.py     # profile parser (no dependencies)
 ├── sherpa-setup.sh       # macOS + Git Bash implementation
 ├── sherpa-setup.ps1      # Windows PowerShell implementation
 ├── LICENSE
@@ -443,7 +534,7 @@ For Windows, run the PowerShell script in a Windows PowerShell environment and v
 Potential future improvements:
 
 * [ ] Dry-run / non-interactive mode
-* [ ] Configuration file support
+* [x] Configuration file support (`sherpa.yml` + `--profile`)
 * [ ] `--minimal` / `--full` setup profiles
 * [ ] Linux support
 * [ ] Better package-manager detection
