@@ -1,0 +1,32 @@
+# sherpa.yml — team or personal machine profile
+# Usage: ./sherpa-setup.sh --profile sherpa.yml
+
+version: 1
+name: example-team
+
+node:
+  manager: nvm        # nvm | direct | skip
+  version: "22"       # or "lts"
+
+python:
+  manager: skip       # pyenv | direct | skip
+  version: "3.12.4"
+
+package_manager: pnpm # npm | pnpm | yarn
+
+ide:
+  choice: skip        # zed | vscode | both | skip
+  vscode_extensions: true
+
+extras:
+  - gh
+  - jq
+  - docker
+
+git:
+  protocol: ssh       # SSH clones (default for teams)
+  clone:
+    dir: ~/dev
+    repos:
+      - acme/web      # shorthand → git@github.com:acme/web.git
+      # - git@github.com:acme/api.git
