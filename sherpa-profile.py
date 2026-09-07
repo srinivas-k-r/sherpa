@@ -155,6 +155,34 @@ def _extras_flags(extras: Any) -> dict[str, bool]:
     return flags
 
 
+def _parse_node_versions(data: dict[str, Any]) -> tuple[list[str], str]:
+    """Accept versions as list, pipe string ('18|20|22'), or legacy version:."""
+    raw = _get(data, "node", "versions", default=None)
+    if raw is None:
+        raw = _get(data, "node", "version", default="lts")
+
+    versions: list[str] = []
+    if isinstance(raw, list):
+        versions = [str(v).strip() for v in raw if str(v).strip()]
+    else:
+        text = str(raw).strip()
+        if "|" in text:
+            versions = [part.strip() for part in text.split("|") if part.strip()]
+        elif text:
+            versions = [text]
+
+    if not versions:
+        versions = ["lts"]
+
+    default = _get(data, "node", "default", default=None)
+    if default is None:
+        default = versions[-1]
+    default = str(default).strip()
+    if default not in versions:
+        versions.append(default)
+    return versions, default
+
+
 def build_profile(path: Path) -> dict[str, Any]:
     data = parse_yaml(path.read_text(encoding="utf-8"))
 
@@ -180,6 +208,7 @@ def build_profile(path: Path) -> dict[str, Any]:
     )
 
     extras = _extras_flags(_get(data, "extras", default=[]))
+    node_versions, node_default = _parse_node_versions(data)
 
     git_protocol = str(_get(data, "git", "protocol", default="ssh")).lower()
     git_ssh = _get(data, "git", "ssh", default=None)
@@ -198,7 +227,9 @@ def build_profile(path: Path) -> dict[str, Any]:
     return {
         "PROFILE_NAME": str(_get(data, "name", default=path.stem)),
         "NODE_CHOICE": node_manager,
-        "NODE_VERSION": str(_get(data, "node", "version", default="lts")),
+        "NODE_VERSIONS": node_versions,
+        "NODE_DEFAULT": node_default,
+        "NODE_VERSION": node_default,
         "PYTHON_CHOICE": python_manager,
         "PYTHON_VERSION": str(_get(data, "python", "version", default="3.12.4")),
         "IDE_CHOICE": ide_choice,
@@ -217,11 +248,14 @@ def _shell_quote(value: str) -> str:
 
 
 def emit_bash(profile: dict[str, Any]) -> None:
+  versions = profile["NODE_VERSIONS"]
   lines = [
       "PROFILE_MODE=true",
       f"PROFILE_NAME={_shell_quote(profile['PROFILE_NAME'])}",
       f"NODE_CHOICE={profile['NODE_CHOICE']}",
       f"NODE_VERSION={_shell_quote(profile['NODE_VERSION'])}",
+      f"NODE_DEFAULT={_shell_quote(profile['NODE_DEFAULT'])}",
+      f"NODE_VERSIONS=({' '.join(_shell_quote(v) for v in versions)})",
       f"PYTHON_CHOICE={profile['PYTHON_CHOICE']}",
       f"PYTHON_VERSION={_shell_quote(profile['PYTHON_VERSION'])}",
       f"IDE_CHOICE={profile['IDE_CHOICE']}",
@@ -255,10 +289,13 @@ def emit_powershell(profile: dict[str, Any]) -> None:
         return "'" + value.replace("'", "''") + "'"
 
     repos = ", ".join(ps_quote(r) for r in profile["CLONE_REPOS"])
+    versions = ", ".join(ps_quote(v) for v in profile["NODE_VERSIONS"])
     print(f"$script:ProfileMode = $true")
     print(f"$script:ProfileName = {ps_quote(profile['PROFILE_NAME'])}")
     print(f"$script:NodeChoice = {profile['NODE_CHOICE']}")
     print(f"$script:NodeVersion = {ps_quote(profile['NODE_VERSION'])}")
+    print(f"$script:NodeDefault = {ps_quote(profile['NODE_DEFAULT'])}")
+    print(f"$script:NodeVersions = @({versions})")
     print(f"$script:PythonChoice = {profile['PYTHON_CHOICE']}")
     print(f"$script:PythonVersion = {ps_quote(profile['PYTHON_VERSION'])}")
     print(f"$script:IdeChoice = {profile['IDE_CHOICE']}")

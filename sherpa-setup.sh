@@ -48,6 +48,8 @@ PROFILE_FILE=""
 PROFILE_MODE=false
 PROFILE_NAME=""
 NODE_VERSION="lts"
+NODE_DEFAULT="lts"
+NODE_VERSIONS=("lts")
 PYTHON_VERSION="3.12.4"
 GIT_SSH_SETUP=false
 CLONE_REPOS=()
@@ -416,7 +418,11 @@ plan_from_profile() {
   fi
 
   case $NODE_CHOICE in
-    0) plan_line "Node.js: install via nvm (version: $NODE_VERSION)" ;;
+    0)
+      local joined
+      joined=$(IFS=', '; echo "${NODE_VERSIONS[*]}")
+      plan_line "Node.js: install via nvm (versions: $joined; default: $NODE_DEFAULT)"
+      ;;
     1) plan_line "Node.js: install LTS directly" ;;
     2) plan_line "Node.js: skip" ;;
   esac
@@ -818,24 +824,30 @@ execute_node() {
   case $NODE_CHOICE in
     0)
       step "nvm..."
+      local nvm_ok=false
       if [ "$PLATFORM" = "mac" ]; then
         if [ -d "$HOME/.nvm" ] || has_cmd nvm; then
           skip "nvm already installed."; add_summary "nvm" "OK" "-" "already installed"
+          nvm_ok=true
         elif curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash; then
           ok "nvm installed."; add_summary "nvm" "OK" "-" "newly installed"
-          NEXT_STEPS+=("Open a new terminal (or 'source ~/.zshrc'), then: nvm install --lts && nvm use --lts")
+          nvm_ok=true
         else
           fail "nvm install failed."; add_summary "nvm" "FAILED" "-" "install command failed"
         fi
       else
         if has_cmd nvm; then
           skip "nvm-windows already installed."; add_summary "nvm-windows" "OK" "-" "already installed"
+          nvm_ok=true
         elif install_pkg "" "CoreyButler.NVMforWindows"; then
           ok "nvm-windows installed."; add_summary "nvm-windows" "OK" "-" "newly installed"
-          NEXT_STEPS+=("Open a NEW terminal, then: nvm install lts && nvm use lts")
+          nvm_ok=true
         else
           fail "nvm-windows install failed."; add_summary "nvm-windows" "FAILED" "-" "install command failed"
         fi
+      fi
+      if $nvm_ok; then
+        install_node_versions_via_nvm
       fi
       ;;
     1)
@@ -848,6 +860,72 @@ execute_node() {
       ;;
     2) add_summary "Node.js" "SKIPPED" "-" "user chose Skip" ;;
   esac
+}
+
+# Load nvm into the current shell (mac). nvm-windows is a different binary.
+load_nvm() {
+  if [ "$PLATFORM" = "mac" ]; then
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+  fi
+  has_cmd nvm || type nvm >/dev/null 2>&1
+}
+
+nvm_install_one() {
+  local ver="$1"
+  if [ "$ver" = "lts" ]; then
+    if [ "$PLATFORM" = "mac" ]; then
+      nvm install --lts
+    else
+      nvm install lts
+    fi
+  else
+    nvm install "$ver"
+  fi
+}
+
+install_node_versions_via_nvm() {
+  step "Node.js versions via nvm..."
+  if ! load_nvm; then
+    skip "nvm not available in this shell yet — reopen terminal, then install versions."
+    add_summary "Node versions" "SKIPPED" "-" "nvm not in PATH yet"
+    local cmds=""
+    local ver
+    for ver in "${NODE_VERSIONS[@]}"; do
+      cmds+="nvm install $ver; "
+    done
+    if [ "$PLATFORM" = "mac" ]; then
+      NEXT_STEPS+=("Open a new terminal (or 'source ~/.nvm/nvm.sh'), then: ${cmds}nvm alias default $NODE_DEFAULT && nvm use $NODE_DEFAULT")
+    else
+      NEXT_STEPS+=("Open a NEW terminal, then: ${cmds}nvm use $NODE_DEFAULT")
+    fi
+    return
+  fi
+
+  local ver installed=0 failed=0
+  for ver in "${NODE_VERSIONS[@]}"; do
+    if nvm_install_one "$ver"; then
+      ok "Node $ver installed."
+      installed=$((installed + 1))
+    else
+      fail "Node $ver install failed."
+      failed=$((failed + 1))
+    fi
+  done
+
+  if [ "$PLATFORM" = "mac" ]; then
+    nvm alias default "$NODE_DEFAULT" >/dev/null 2>&1 || true
+    nvm use "$NODE_DEFAULT" >/dev/null 2>&1 || true
+  else
+    nvm use "$NODE_DEFAULT" >/dev/null 2>&1 || true
+  fi
+
+  if [ $failed -eq 0 ]; then
+    add_summary "Node versions" "OK" "$NODE_DEFAULT" "installed: ${NODE_VERSIONS[*]} (default $NODE_DEFAULT)"
+  else
+    add_summary "Node versions" "FAILED" "-" "$installed OK, $failed failed"
+  fi
 }
 
 # execute_package_manager -- npm needs nothing extra (it ships with Node).
