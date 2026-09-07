@@ -184,7 +184,8 @@ name: acme-frontend
 
 node:
   manager: nvm
-  version: "22"
+  versions: "18|20|22"   # pipe, YAML list, or single "22"
+  default: "22"
 
 package_manager: pnpm
 

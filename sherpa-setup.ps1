@@ -29,6 +29,8 @@ $ProfileFile = ""
 $ProfileMode = $false
 $ProfileName = ""
 $NodeVersion = "lts"
+$NodeDefault = "lts"
+$NodeVersions = @("lts")
 $PythonVersion = "3.12.4"
 $GitSshSetup = $false
 $CloneRepos = @()
@@ -304,7 +306,7 @@ function Add-PlanFromProfile {
     }
 
     switch ($NodeChoice) {
-        0 { Add-PlanLine "Node.js: install via nvm-windows (version: $NodeVersion)" }
+        0 { Add-PlanLine "Node.js: install via nvm-windows (versions: $($NodeVersions -join ', '); default: $NodeDefault)" }
         1 { Add-PlanLine "Node.js: install LTS directly" }
         2 { Add-PlanLine "Node.js: skip" }
     }
@@ -658,17 +660,20 @@ function Execute-Node {
     switch ($NodeChoice) {
         0 {
             Step "nvm-windows..."
+            $nvmOk = $false
             if (Has-Command "nvm") {
                 Skip "nvm-windows already installed."
                 Add-Summary "nvm-windows" "OK" "-" "already installed"
+                $nvmOk = $true
             } elseif (Install-WingetPackage "CoreyButler.NVMforWindows") {
                 Ok "nvm-windows installed."
                 Add-Summary "nvm-windows" "OK" "-" "newly installed"
-                [void]$NextSteps.Add("Open a NEW terminal, then: nvm install lts && nvm use lts")
+                $nvmOk = $true
             } else {
                 Fail "nvm-windows install failed."
                 Add-Summary "nvm-windows" "FAILED" "-" "install command failed"
             }
+            if ($nvmOk) { Install-NodeVersionsViaNvm }
         }
         1 {
             Step "Node.js LTS..."
@@ -681,6 +686,38 @@ function Execute-Node {
             }
         }
         2 { Add-Summary "Node.js" "SKIPPED" "-" "user chose Skip" }
+    }
+}
+
+function Install-NodeVersionsViaNvm {
+    Step "Node.js versions via nvm..."
+    if (-not (Has-Command "nvm")) {
+        Skip "nvm not available in this shell yet — reopen terminal, then install versions."
+        Add-Summary "Node versions" "SKIPPED" "-" "nvm not in PATH yet"
+        $cmds = ($NodeVersions | ForEach-Object { "nvm install $_" }) -join "; "
+        [void]$NextSteps.Add("Open a NEW terminal, then: $cmds; nvm use $NodeDefault")
+        return
+    }
+
+    $installed = 0
+    $failed = 0
+    foreach ($ver in $NodeVersions) {
+        $arg = if ($ver -eq "lts") { "lts" } else { $ver }
+        & nvm install $arg
+        if ($LASTEXITCODE -eq 0) {
+            Ok "Node $ver installed."
+            $installed++
+        } else {
+            Fail "Node $ver install failed."
+            $failed++
+        }
+    }
+
+    & nvm use $NodeDefault *> $null
+    if ($failed -eq 0) {
+        Add-Summary "Node versions" "OK" $NodeDefault "installed: $($NodeVersions -join ' ') (default $NodeDefault)"
+    } else {
+        Add-Summary "Node versions" "FAILED" "-" "$installed OK, $failed failed"
     }
 }
 

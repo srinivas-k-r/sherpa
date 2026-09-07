@@ -1,32 +1,58 @@
-# sherpa.yml — team or personal machine profile
-# Usage: ./sherpa-setup.sh --profile sherpa.yml
+# =============================================================================
+# Sherpa profile — FILL THIS IN, then zip with the scripts and share on Slack
+#
+# Teammate runs:
+#   ./sherpa-setup.sh --profile sherpa.yml
+#   .\sherpa-setup.ps1 -Profile sherpa.yml
+# =============================================================================
 
 version: 1
-name: example-team
+name: YOUR_TEAM_NAME
 
+# --- Node.js -----------------------------------------------------------------
 node:
-  manager: nvm        # nvm | direct | skip
-  version: "22"       # or "lts"
+  manager: nvm              # nvm | direct | skip
+  # One version:
+  #   versions: "22"
+  # Multiple versions (pipe OR list — both work):
+  versions: "18|20|22"
+  # versions:
+  #   - "18"
+  #   - "20"
+  #   - "22"
+  default: "22"             # which version `nvm use` / default alias points at
 
+# --- Python ------------------------------------------------------------------
 python:
-  manager: skip       # pyenv | direct | skip
+  manager: skip             # pyenv | direct | skip
   version: "3.12.4"
 
-package_manager: pnpm # npm | pnpm | yarn
+# --- Package manager (needs Node) --------------------------------------------
+package_manager: pnpm       # npm | pnpm | yarn
 
+# --- IDE ---------------------------------------------------------------------
 ide:
-  choice: skip        # zed | vscode | both | skip
-  vscode_extensions: true
+  choice: skip              # zed | vscode | both | skip
+  vscode_extensions: true   # only used if vscode or both
 
+# --- Optional tools (delete lines you don't want) ----------------------------
 extras:
-  - gh
+  - gh                      # required for SSH key upload + GitHub
   - jq
-  - docker
+  # - docker
+  # - postman
+  # - chrome
+  # - firefox
+  # - starship
 
+# --- Git / SSH / clone -------------------------------------------------------
 git:
-  protocol: ssh       # SSH clones (default for teams)
+  protocol: ssh             # ssh (recommended) — uploads key via gh, no browser
   clone:
-    dir: ~/dev
+    dir: ~/dev              # parent folder for clones
     repos:
-      - acme/web      # shorthand → git@github.com:acme/web.git
-      # - git@github.com:acme/api.git
+      # shorthand → git@github.com:org/repo.git
+      - YOUR_ORG/YOUR_REPO
+      # - YOUR_ORG/ANOTHER_REPO
+      # or full URL:
+      # - git@github.com:YOUR_ORG/YOUR_REPO.git
