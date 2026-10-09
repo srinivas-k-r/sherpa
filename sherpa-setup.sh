@@ -9,17 +9,18 @@
 #   Windows: run from Git Bash (not plain CMD/PowerShell)
 #             ./sherpa-setup.sh
 #
-# Flow (three phases, run in this order):
-#   1. GATHER  - ask every question up front. Pure input collection, zero
-#                side effects, nothing touches the machine yet.
-#   2. PLAN    - print exactly what will happen based on those answers, and
-#                ask for one final go/no-go confirmation.
-#   3. EXECUTE - run the actual installs, printing OK / SKIPPED / FAILED as
-#                it goes, then print a summary table + "next steps" notes.
+# Two ways to walk:
+#   Picnic   (no args)     You pack the basket. Leaving something behind is
+#                          allowed.
+#   Catered  (--profile)   The yaml is the menu. You don't send a dish back.
 #
-# This separation is the whole point of the UX: you always see the full
-# plan before anything installs, and Ctrl+C during GATHER or PLAN is 100%
-# safe (nothing has happened to your machine yet).
+# Both ways: gear that's already installed is walked past, and one spill
+# (a failed install, a failed clone) never cancels the rest of the meal.
+# The summary always prints. Ctrl+C during GATHER or PLAN is safe — nothing
+# has been installed yet. Homebrew, if it's missing, is the one thing that
+# may download before the menu, because the rest of the picnic rides on it.
+#
+# Flow: GATHER → PLAN → CONFIRM → EXECUTE → SUMMARY
 #
 # Layout (top to bottom):
 #   - Config & globals
@@ -58,7 +59,7 @@ CLONE_REPOS=()
 GIT_ALREADY_INSTALLED=false
 GIT_WANT_INSTALL=false
 
-IDE_CHOICE=3           # 0=Zed 1=VSCode 2=Both 3=Skip
+IDE_CHOICE=4           # 0=Zed 1=VSCode 2=Cursor 3=Zed+VSCode 4=Skip
 WANT_VSCODE_EXTENSIONS=false   # starter pack: Prettier, ESLint, GitLens
 
 NODE_CHOICE=2           # 0=nvm 1=direct 2=skip
@@ -73,6 +74,7 @@ WANT_CHROME=false
 WANT_FIREFOX=false
 WANT_JQ=false
 WANT_STARSHIP=false
+WANT_CLAUDE=false
 
 GITCONFIG_NEEDED=false
 GITCONFIG_NAME=""
@@ -81,6 +83,11 @@ GITCONFIG_EMAIL=""
 WANT_CLONE=false
 CLONE_URLS_RAW=""
 CLONE_DIR=""
+
+# True once brew (mac) or winget (windows) is actually usable.
+PKG_MGR_READY=false
+# Set by execute_extra_cli so Starship only nags when it was just installed.
+EXTRA_FRESH=false
 
 # --- Human-readable plan lines, printed before the confirm prompt ---
 PLAN_LINES=()
@@ -157,6 +164,21 @@ step()  { echo -e "${YELLOW}>> $1${NC}"; }
 ok()    { echo -e "${GREEN}   [OK] $1${NC}"; }
 skip()  { echo -e "${GRAY}   [SKIP] $1${NC}"; }
 fail()  { echo -e "${RED}   [FAILED] $1${NC}"; }
+
+# Already on the machine: don't install it again.
+walk_past() { skip "$1 is already in the pack. Walking past it."; }
+
+# This step failed. The next one still runs.
+slipped() { fail "$1 slipped off the yak. Noted. Still walking."; }
+
+# Why a row was skipped on purpose (a choice), as opposed to "already here".
+left_behind() {
+  if $PROFILE_MODE; then
+    printf '%s' "not on the menu"
+  else
+    printf '%s' "left at camp"
+  fi
+}
 
 plan_line()   { PLAN_LINES+=("$1"); }
 add_summary() { SUMMARY_NAMES+=("$1"); SUMMARY_STATUS+=("$2"); SUMMARY_VERSIONS+=("${3:--}"); SUMMARY_NOTES+=("${4:--}"); }
@@ -265,16 +287,21 @@ select_menu_fallback() {
 
 print_plan_and_confirm() {
   echo ""
-  echo -e "${CYAN}=================== Plan =====================${NC}"
-  echo "Here's what I'm about to do:"
+  if $PROFILE_MODE; then
+    echo -e "${CYAN}=================== The menu =================${NC}"
+    echo "Catered. No sending plates back."
+  else
+    echo -e "${CYAN}=================== The basket ================${NC}"
+    echo "Picnic. This is everything you said yes to."
+  fi
   local line
   for line in "${PLAN_LINES[@]}"; do
     echo "  - $line"
   done
   echo -e "${CYAN}================================================${NC}"
   echo ""
-  if ! ask_yesno "Proceed?" "y"; then
-    echo -e "${GRAY}Nothing was installed. Exiting.${NC}"
+  if ! ask_yesno "Pack it?" "y"; then
+    echo -e "${GRAY}Leaving the basket on the blanket. Nothing was packed.${NC}"
     exit 0
   fi
 }
@@ -315,8 +342,17 @@ usage() {
   cat <<'EOF'
 Usage: sherpa-setup.sh [options]
 
+Picnic (just run it):
+  You pack the basket. Say no to anything you don't want to carry.
+
+Catered (--profile <file>):
+  The yaml is the menu. You don't get to send a dish back.
+
+Either way, gear that's already installed is walked past, and one spill
+doesn't cancel the rest of the meal.
+
 Options:
-  --profile <file>   Read stack from a sherpa.yml profile (skips the wizard)
+  --profile <file>   Catered mode. Cook the menu in this file.
   -h, --help         Show this help
 
 Examples:
@@ -332,6 +368,7 @@ parse_args() {
       --profile)
         [ $# -ge 2 ] || { echo -e "${RED}--profile requires a file path.${NC}"; exit 1; }
         PROFILE_FILE="$2"
+        PROFILE_MODE=true
         shift 2
         ;;
       -h|--help)
@@ -349,11 +386,13 @@ parse_args() {
 
 expand_home() {
   local path="$1"
-  case "$path" in
-    "~") echo "$HOME" ;;
-    "~/"*) echo "$HOME/${path#~/}" ;;
-    *) echo "$path" ;;
-  esac
+  if [ "$path" = "~" ]; then
+    printf '%s\n' "$HOME"
+  elif [ "${path#\~/}" != "$path" ]; then
+    printf '%s\n' "$HOME/${path#\~/}"
+  else
+    printf '%s\n' "$path"
+  fi
 }
 
 resolve_repo_url() {
@@ -404,8 +443,9 @@ yaml_map_choice() {
     python.manager:skip) echo 2 ;;
     ide.choice:zed) echo 0 ;;
     ide.choice:vscode) echo 1 ;;
-    ide.choice:both) echo 2 ;;
-    ide.choice:skip) echo 3 ;;
+    ide.choice:cursor) echo 2 ;;
+    ide.choice:both) echo 3 ;;
+    ide.choice:skip) echo 4 ;;
     package_manager:npm) echo 0 ;;
     package_manager:pnpm) echo 1 ;;
     package_manager:yarn) echo 2 ;;
@@ -432,7 +472,7 @@ load_profile() {
   NODE_VERSIONS=()
   PYTHON_CHOICE=2
   PYTHON_VERSION="3.12.4"
-  IDE_CHOICE=3
+  IDE_CHOICE=4
   WANT_VSCODE_EXTENSIONS=false
   PKG_MANAGER_CHOICE=0
   WANT_GH_CLI=false
@@ -442,6 +482,7 @@ load_profile() {
   WANT_FIREFOX=false
   WANT_JQ=false
   WANT_STARSHIP=false
+  WANT_CLAUDE=false
   GIT_SSH_SETUP=false
   WANT_CLONE=false
   CLONE_DIR="$HOME/dev"
@@ -476,6 +517,7 @@ load_profile() {
             firefox) WANT_FIREFOX=true ;;
             jq) WANT_JQ=true ;;
             starship) WANT_STARSHIP=true ;;
+            claude) WANT_CLAUDE=true ;;
             *) echo -e "${RED}Unknown extra: $item${NC}"; exit 1 ;;
           esac
           ;;
@@ -612,7 +654,7 @@ plan_from_profile() {
 
   if has_cmd git; then
     GIT_ALREADY_INSTALLED=true
-    plan_line "Git: already installed ($(git --version | awk '{print $3}'))"
+    plan_line "Git: already in the pack — walking past it"
   else
     GIT_WANT_INSTALL=true
     plan_line "Git: install"
@@ -621,14 +663,15 @@ plan_from_profile() {
   case $IDE_CHOICE in
     0) plan_line "IDE: install Zed" ;;
     1) plan_line "IDE: install VS Code" ;;
-    2) plan_line "IDE: install Zed and VS Code" ;;
-    3) plan_line "IDE: skip" ;;
+    2) plan_line "IDE: install Cursor" ;;
+    3) plan_line "IDE: install Zed and VS Code" ;;
+    4) plan_line "IDE: not on the menu" ;;
   esac
-  if [ "$IDE_CHOICE" -eq 1 ] || [ "$IDE_CHOICE" -eq 2 ]; then
+  if [ "$IDE_CHOICE" -eq 1 ] || [ "$IDE_CHOICE" -eq 3 ]; then
     if $WANT_VSCODE_EXTENSIONS; then
       plan_line "VS Code extensions: install Prettier, ESLint, GitLens"
     else
-      plan_line "VS Code extensions: skip"
+      plan_line "VS Code extensions: not on the menu"
     fi
   fi
 
@@ -639,7 +682,7 @@ plan_from_profile() {
       plan_line "Node.js: install via nvm (versions: $joined; default: $NODE_DEFAULT)"
       ;;
     1) plan_line "Node.js: install LTS directly" ;;
-    2) plan_line "Node.js: skip" ;;
+    2) plan_line "Node.js: not on the menu" ;;
   esac
   case $PKG_MANAGER_CHOICE in
     0) plan_line "Package manager: npm" ;;
@@ -650,16 +693,17 @@ plan_from_profile() {
   case $PYTHON_CHOICE in
     0) plan_line "Python: install via pyenv (version: $PYTHON_VERSION)" ;;
     1) plan_line "Python: install directly" ;;
-    2) plan_line "Python: skip" ;;
+    2) plan_line "Python: not on the menu" ;;
   esac
 
-  $WANT_GH_CLI && plan_line "GitHub CLI: install" || plan_line "GitHub CLI: skip"
-  $WANT_DOCKER && plan_line "Docker Desktop: install" || plan_line "Docker Desktop: skip"
-  $WANT_POSTMAN && plan_line "Postman: install" || plan_line "Postman: skip"
-  $WANT_CHROME && plan_line "Chrome: install" || plan_line "Chrome: skip"
-  $WANT_FIREFOX && plan_line "Firefox: install" || plan_line "Firefox: skip"
-  $WANT_JQ && plan_line "jq: install" || plan_line "jq: skip"
-  $WANT_STARSHIP && plan_line "Starship prompt: install" || plan_line "Starship prompt: skip"
+  $WANT_GH_CLI && plan_line "GitHub CLI: install" || plan_line "GitHub CLI: not on the menu"
+  $WANT_DOCKER && plan_line "Docker Desktop: install" || plan_line "Docker Desktop: not on the menu"
+  $WANT_POSTMAN && plan_line "Postman: install" || plan_line "Postman: not on the menu"
+  $WANT_CHROME && plan_line "Chrome: install" || plan_line "Chrome: not on the menu"
+  $WANT_FIREFOX && plan_line "Firefox: install" || plan_line "Firefox: not on the menu"
+  $WANT_JQ && plan_line "jq: install" || plan_line "jq: not on the menu"
+  $WANT_STARSHIP && plan_line "Starship prompt: install" || plan_line "Starship prompt: not on the menu"
+  $WANT_CLAUDE && plan_line "Claude Desktop: install" || plan_line "Claude Desktop: not on the menu"
 
   local name email
   name=$(git config --global user.name 2>/dev/null || true)
@@ -673,7 +717,7 @@ plan_from_profile() {
   if $GIT_SSH_SETUP; then
     plan_line "SSH: generate key if needed, upload to GitHub via gh (terminal only)"
   else
-    plan_line "SSH: skip"
+    plan_line "SSH: not on the menu"
   fi
 
   if $WANT_CLONE; then
@@ -684,7 +728,7 @@ plan_from_profile() {
       plan_line "  - $resolved"
     done
   else
-    plan_line "Clone repo(s): skip"
+    plan_line "Clone repo(s): not on the menu"
   fi
 }
 
@@ -697,17 +741,24 @@ gather_git_config_interactive() {
     plan_line "git config: already set ($name <$email>)"
     return
   fi
-  if $PROFILE_MODE || ask_yesno "git user.name/email isn't fully set. Set it now?" "y"; then
+  if $PROFILE_MODE; then
+    echo -e "\n${GRAY}Git doesn't know your name yet. Catered menus don't carry that — it's personal.${NC}"
     GITCONFIG_NEEDED=true
     [ -z "$name" ]  && name=$(ask_text "Your name for git commits")
     [ -z "$email" ] && email=$(ask_text "Your email for git commits")
     GITCONFIG_NAME="$name"
     GITCONFIG_EMAIL="$email"
-    if ! $PROFILE_MODE; then
-      plan_line "git config: set user.name/email to $name <$email>"
-    fi
-  elif ! $PROFILE_MODE; then
-    plan_line "git config: leave as-is"
+    return
+  fi
+  if ask_yesno "git user.name/email isn't fully set. Set it now?" "y"; then
+    GITCONFIG_NEEDED=true
+    [ -z "$name" ]  && name=$(ask_text "Your name for git commits")
+    [ -z "$email" ] && email=$(ask_text "Your email for git commits")
+    GITCONFIG_NAME="$name"
+    GITCONFIG_EMAIL="$email"
+    plan_line "git config: set user.name/email to $name <$email>"
+  else
+    plan_line "git config: left at camp"
   fi
 }
 
@@ -734,32 +785,65 @@ get_version() {
   has_cmd "$cmd" && "$cmd" --version 2>&1 | head -n1 || echo ""
 }
 
+# Download the Homebrew installer ourselves so a failed curl can't look like
+# success (bash -c "" exits 0) and can't take the rest of the picnic with it.
+install_homebrew() {
+  local script rc
+  script="$(mktemp)"
+  if ! curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$script"; then
+    rm -f "$script"
+    return 1
+  fi
+  /bin/bash "$script"
+  rc=$?
+  rm -f "$script"
+  return $rc
+}
+
 ensure_pkg_manager() {
   if [ "$PLATFORM" = "mac" ]; then
     step "Checking Homebrew..."
     if has_cmd brew; then
-      ok "Homebrew already installed."
+      walk_past "Homebrew"
+      PKG_MGR_READY=true
+      add_summary "Homebrew" "SKIPPED" "-" "already in the pack"
     else
-      if ask_yesno "Homebrew isn't installed (required for everything below). Install it now?"; then
-        if /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+      local install_it=false
+      if $PROFILE_MODE; then
+        echo -e "  ${GRAY}Catered mode. Homebrew isn't here, so I'm fetching it. The menu doesn't ask.${NC}"
+        install_it=true
+      elif ask_yesno "Homebrew isn't installed. Bring it? Most of the picnic rides on it."; then
+        install_it=true
+      fi
+      if $install_it; then
+        if install_homebrew; then
           [ -d "/opt/homebrew/bin" ] && eval "$(/opt/homebrew/bin/brew shellenv)"
-          ok "Homebrew installed."
+          ok "Homebrew is on the yak."
+          PKG_MGR_READY=true
+          add_summary "Homebrew" "OK" "-" "fresh off the trail"
         else
-          fail "Homebrew install failed. Exiting."
-          exit 1
+          slipped "Homebrew"
+          PKG_MGR_READY=false
+          add_summary "Homebrew" "FAILED" "-" "install slipped"
+          echo -e "  ${GRAY}Anything that needed Homebrew will slip too. The rest of the picnic keeps going.${NC}"
         fi
       else
-        fail "Homebrew is required to continue. Exiting."
-        exit 1
+        skip "Homebrew left at camp. Anything that needs it will slip, and we'll keep walking."
+        PKG_MGR_READY=false
+        add_summary "Homebrew" "SKIPPED" "-" "left at camp"
       fi
     fi
   else
     step "Checking winget..."
     if has_cmd winget.exe || has_cmd winget; then
-      ok "winget is available."
+      walk_past "winget"
+      PKG_MGR_READY=true
+      add_summary "winget" "SKIPPED" "-" "already in the pack"
     else
-      fail "winget not found. Install 'App Installer' from the Microsoft Store, then re-run this script."
-      exit 1
+      slipped "winget"
+      PKG_MGR_READY=false
+      add_summary "winget" "FAILED" "-" "not on this machine"
+      echo -e "  ${GRAY}Install 'App Installer' from the Microsoft Store, then run me again. Meanwhile, I'll keep walking.${NC}"
     fi
   fi
 }
@@ -767,6 +851,9 @@ ensure_pkg_manager() {
 # install_pkg <brew-formula> <winget-id> [cask: true|false]
 install_pkg() {
   local brew_formula="$1" winget_id="$2" is_cask="${3:-false}"
+  if ! $PKG_MGR_READY; then
+    return 1
+  fi
   if [ "$PLATFORM" = "mac" ]; then
     if [ "$is_cask" = "true" ]; then brew install --cask "$brew_formula"; else brew install "$brew_formula"; fi
   else
@@ -791,13 +878,13 @@ copy_to_clipboard() {
 gather_git() {
   if has_cmd git; then
     GIT_ALREADY_INSTALLED=true
-    plan_line "Git: already installed ($(git --version | awk '{print $3}')) -- nothing to do"
+    plan_line "Git: already in the pack — walking past it"
   else
-    if ask_yesno "Git isn't installed. Install it?"; then
+    if ask_yesno "Git isn't installed. Toss it in the basket?"; then
       GIT_WANT_INSTALL=true
       plan_line "Git: install"
     else
-      plan_line "Git: skip (you said no)"
+      plan_line "Git: left at camp"
     fi
   fi
 }
@@ -806,22 +893,24 @@ gather_ide() {
   select_menu "Which IDE would you like to install?" \
     "Zed (fast, Rust-based, built-in AI)" \
     "VS Code (most popular, huge extension ecosystem)" \
-    "Both" \
+    "Cursor (AI editor, chat in the sidebar)" \
+    "Zed and VS Code" \
     "Skip"
   IDE_CHOICE=$MENU_RESULT
   case $IDE_CHOICE in
     0) plan_line "IDE: install Zed" ;;
     1) plan_line "IDE: install VS Code" ;;
-    2) plan_line "IDE: install Zed and VS Code" ;;
-    3) plan_line "IDE: skip" ;;
+    2) plan_line "IDE: install Cursor" ;;
+    3) plan_line "IDE: install Zed and VS Code" ;;
+    4) plan_line "IDE: left at camp" ;;
   esac
 
-  if [ "$IDE_CHOICE" -eq 1 ] || [ "$IDE_CHOICE" -eq 2 ]; then
-    if ask_yesno "Install a starter VS Code extension pack (Prettier, ESLint, GitLens)?" "y"; then
+  if [ "$IDE_CHOICE" -eq 1 ] || [ "$IDE_CHOICE" -eq 3 ]; then
+    if ask_yesno "Toss in a VS Code snack pack (Prettier, ESLint, GitLens)?" "y"; then
       WANT_VSCODE_EXTENSIONS=true
-      plan_line "VS Code extensions: install Prettier, ESLint, GitLens"
+      plan_line "VS Code extensions: Prettier, ESLint, GitLens"
     else
-      plan_line "VS Code extensions: skip"
+      plan_line "VS Code extensions: left at camp"
     fi
   fi
 }
@@ -835,7 +924,7 @@ gather_node() {
   case $NODE_CHOICE in
     0) plan_line "Node.js: install via nvm" ;;
     1) plan_line "Node.js: install LTS directly" ;;
-    2) plan_line "Node.js: skip" ;;
+    2) plan_line "Node.js: left at camp" ;;
   esac
 
   gather_package_manager
@@ -843,7 +932,7 @@ gather_node() {
 
 gather_package_manager() {
   if [ "$NODE_CHOICE" -eq 2 ] && ! has_cmd node; then
-    plan_line "Package manager: skip (no Node.js)"
+    plan_line "Package manager: left at camp (no Node.js)"
     return
   fi
   select_menu "Which package manager would you like as your default?" \
@@ -867,46 +956,51 @@ gather_python() {
   case $PYTHON_CHOICE in
     0) plan_line "Python: install via pyenv" ;;
     1) plan_line "Python: install 3.x directly" ;;
-    2) plan_line "Python: skip" ;;
+    2) plan_line "Python: left at camp" ;;
   esac
 }
 
 gather_extras() {
-  echo -e "\nA couple of optional extras:"
+  echo -e "\n${BOLD}Snack table.${NC} Take what you want, leave what you don't."
   if ask_yesno "Install GitHub CLI (gh)?" "y"; then
     WANT_GH_CLI=true; plan_line "GitHub CLI: install"
   else
-    plan_line "GitHub CLI: skip"
+    plan_line "GitHub CLI: left at camp"
   fi
   if ask_yesno "Install Docker Desktop?" "n"; then
     WANT_DOCKER=true; plan_line "Docker Desktop: install"
   else
-    plan_line "Docker Desktop: skip"
+    plan_line "Docker Desktop: left at camp"
   fi
   if ask_yesno "Install Postman?" "y"; then
     WANT_POSTMAN=true; plan_line "Postman: install"
   else
-    plan_line "Postman: skip"
+    plan_line "Postman: left at camp"
   fi
   if ask_yesno "Install Chrome?" "y"; then
     WANT_CHROME=true; plan_line "Chrome: install"
   else
-    plan_line "Chrome: skip"
+    plan_line "Chrome: left at camp"
   fi
   if ask_yesno "Install Firefox?" "n"; then
     WANT_FIREFOX=true; plan_line "Firefox: install"
   else
-    plan_line "Firefox: skip"
+    plan_line "Firefox: left at camp"
   fi
   if ask_yesno "Install jq (JSON CLI tool)?" "y"; then
     WANT_JQ=true; plan_line "jq: install"
   else
-    plan_line "jq: skip"
+    plan_line "jq: left at camp"
   fi
   if ask_yesno "Install Starship (fast, cross-shell prompt)?" "y"; then
     WANT_STARSHIP=true; plan_line "Starship prompt: install"
   else
-    plan_line "Starship prompt: skip"
+    plan_line "Starship prompt: left at camp"
+  fi
+  if ask_yesno "And Claude Desktop? The other brain, in its own window." "y"; then
+    WANT_CLAUDE=true; plan_line "Claude Desktop: install"
+  else
+    plan_line "Claude Desktop: left at camp"
   fi
 }
 
@@ -926,33 +1020,33 @@ gather_git_config() {
     GITCONFIG_EMAIL="$email"
     plan_line "git config: set user.name/email to $name <$email>"
   else
-    plan_line "git config: leave as-is"
+    plan_line "git config: left at camp"
   fi
 }
 
 gather_ssh_setup() {
   if $PROFILE_MODE; then return; fi
-  if ask_yesno "Set up SSH for GitHub (generate key + upload via gh, no browser)?" "n"; then
+  if ask_yesno "Mint a GitHub SSH key and hand it to gh? No browser, I promise." "n"; then
     GIT_SSH_SETUP=true
     WANT_GH_CLI=true
-    plan_line "SSH: generate key if needed, upload to GitHub via gh (terminal only)"
+    plan_line "SSH: mint a key if needed, hand it to gh"
   else
-    plan_line "SSH: skip"
+    plan_line "SSH: left at camp"
   fi
 }
 
 gather_clone_repos() {
-  if ask_yesno "Clone a repo now?" "n"; then
+  if ask_yesno "Toss any repos in the basket now?" "n"; then
     CLONE_URLS_RAW=$(ask_text "Repo URL(s), comma-separated" "")
     if [ -z "$CLONE_URLS_RAW" ]; then
-      plan_line "Clone repo(s): skip (no URL entered)"
+      plan_line "Clone repo(s): left at camp (no URL)"
       return
     fi
     CLONE_DIR=$(ask_text "Parent folder to clone into" "$HOME/dev")
     WANT_CLONE=true
     plan_line "Clone repo(s) into $CLONE_DIR: $CLONE_URLS_RAW"
   else
-    plan_line "Clone repo(s): skip"
+    plan_line "Clone repo(s): left at camp"
   fi
 }
 
@@ -961,47 +1055,87 @@ gather_clone_repos() {
 # =============================================================================
 
 execute_git() {
-  if $GIT_ALREADY_INSTALLED; then
-    add_summary "Git" "OK" "$(git --version | awk '{print $3}')" "already installed"
+  if $GIT_ALREADY_INSTALLED || has_cmd git; then
+    walk_past "Git"
+    add_summary "Git" "SKIPPED" "$(git --version 2>/dev/null | awk '{print $3}')" "already in the pack"
     return
   fi
   if ! $GIT_WANT_INSTALL; then
-    add_summary "Git" "SKIPPED" "-" "user chose Skip"
+    add_summary "Git" "SKIPPED" "-" "$(left_behind)"
     return
   fi
   step "Git..."
   if install_pkg "git" "Git.Git"; then
-    ok "Git installed."
-    add_summary "Git" "OK" "$(get_version git | awk '{print $3}')" "newly installed"
+    ok "Git is in the pack."
+    add_summary "Git" "OK" "$(get_version git | awk '{print $3}')" "fresh off the trail"
   else
-    fail "Git install failed."
-    add_summary "Git" "FAILED" "-" "install command failed"
+    slipped "Git"
+    add_summary "Git" "FAILED" "-" "install slipped"
   fi
+}
+
+zed_present() {
+  has_cmd zed && return 0
+  [ "$PLATFORM" = "mac" ] && mac_app_installed "Zed.app"
+}
+
+code_present() {
+  has_cmd code && return 0
+  [ "$PLATFORM" = "mac" ] && mac_app_installed "Visual Studio Code.app"
+}
+
+cursor_present() {
+  has_cmd cursor && return 0
+  [ "$PLATFORM" = "mac" ] && mac_app_installed "Cursor.app"
 }
 
 execute_ide() {
   install_zed() {
+    if zed_present; then
+      walk_past "Zed"
+      add_summary "Zed" "SKIPPED" "-" "already in the pack"
+      return
+    fi
     step "Zed..."
     if install_pkg "zed" "ZedIndustries.Zed" "true"; then
-      ok "Zed installed."; add_summary "Zed" "OK" "-" "newly installed"
+      ok "Zed is in the pack."; add_summary "Zed" "OK" "-" "fresh off the trail"
     else
-      fail "Zed install failed."; add_summary "Zed" "FAILED" "-" "install command failed"
+      slipped "Zed"; add_summary "Zed" "FAILED" "-" "install slipped"
     fi
   }
   install_vscode() {
-    step "VS Code..."
-    if install_pkg "visual-studio-code" "Microsoft.VisualStudioCode" "true"; then
-      ok "VS Code installed."; add_summary "VS Code" "OK" "-" "newly installed"
+    if code_present; then
+      walk_past "VS Code"
+      add_summary "VS Code" "SKIPPED" "-" "already in the pack"
     else
-      fail "VS Code install failed."; add_summary "VS Code" "FAILED" "-" "install command failed"
+      step "VS Code..."
+      if install_pkg "visual-studio-code" "Microsoft.VisualStudioCode" "true"; then
+        ok "VS Code is in the pack."; add_summary "VS Code" "OK" "-" "fresh off the trail"
+      else
+        slipped "VS Code"; add_summary "VS Code" "FAILED" "-" "install slipped"
+      fi
     fi
     install_vscode_extensions
+  }
+  install_cursor() {
+    if cursor_present; then
+      walk_past "Cursor"
+      add_summary "Cursor" "SKIPPED" "-" "already in the pack"
+      return
+    fi
+    step "Cursor..."
+    if install_pkg "cursor" "Anysphere.Cursor" "true"; then
+      ok "Cursor is in the pack."; add_summary "Cursor" "OK" "-" "fresh off the trail"
+    else
+      slipped "Cursor"; add_summary "Cursor" "FAILED" "-" "install slipped"
+    fi
   }
   case $IDE_CHOICE in
     0) install_zed ;;
     1) install_vscode ;;
-    2) install_zed; install_vscode ;;
-    3) add_summary "IDE" "SKIPPED" "-" "user chose Skip" ;;
+    2) install_cursor ;;
+    3) install_zed; install_vscode ;;
+    4) add_summary "IDE" "SKIPPED" "-" "$(left_behind)" ;;
   esac
 }
 
@@ -1012,26 +1146,37 @@ execute_ide() {
 # failing outright.
 install_vscode_extensions() {
   if ! $WANT_VSCODE_EXTENSIONS; then
-    add_summary "VS Code extensions" "SKIPPED" "-" "user chose Skip"
+    add_summary "VS Code extensions" "SKIPPED" "-" "$(left_behind)"
     return
   fi
-  step "VS Code starter extensions..."
+  step "VS Code snack pack..."
   if ! has_cmd code; then
-    skip "'code' CLI not on PATH yet -- can't install extensions this run."
+    skip "The code command hasn't caught up yet. Extensions can wait at camp."
     add_summary "VS Code extensions" "SKIPPED" "-" "code CLI not on PATH"
-    NEXT_STEPS+=("After reopening your terminal, run: code --install-extension esbenp.prettier-vscode && code --install-extension dbaeumer.vscode-eslint && code --install-extension eamodio.gitlens")
+    NEXT_STEPS+=("After a new terminal: code --install-extension esbenp.prettier-vscode && code --install-extension dbaeumer.vscode-eslint && code --install-extension eamodio.gitlens")
     return
   fi
-  local exts=(esbenp.prettier-vscode dbaeumer.vscode-eslint eamodio.gitlens) failed=0 ext
+  local exts=(esbenp.prettier-vscode dbaeumer.vscode-eslint eamodio.gitlens)
+  local failed=0 skipped=0 installed=0 ext have=""
+  have="$(code --list-extensions 2>/dev/null || true)"
   for ext in "${exts[@]}"; do
-    code --install-extension "$ext" --force >/dev/null 2>&1 || failed=$((failed + 1))
+    if printf '%s\n' "$have" | grep -qx "$ext"; then
+      skipped=$((skipped + 1))
+    elif code --install-extension "$ext" --force >/dev/null 2>&1; then
+      installed=$((installed + 1))
+    else
+      slipped "$ext"
+      failed=$((failed + 1))
+    fi
   done
-  if [ $failed -eq 0 ]; then
-    ok "Prettier, ESLint, GitLens installed."
-    add_summary "VS Code extensions" "OK" "-" "Prettier, ESLint, GitLens"
+  if [ "$failed" -gt 0 ]; then
+    add_summary "VS Code extensions" "FAILED" "-" "$installed packed, $skipped already there, $failed slipped"
+  elif [ "$installed" -eq 0 ]; then
+    walk_past "VS Code extensions"
+    add_summary "VS Code extensions" "SKIPPED" "-" "already in the pack"
   else
-    fail "$failed of ${#exts[@]} extension(s) failed to install."
-    add_summary "VS Code extensions" "FAILED" "-" "$failed of ${#exts[@]} failed"
+    ok "Snack pack's in. Prettier, ESLint, GitLens."
+    add_summary "VS Code extensions" "OK" "-" "Prettier, ESLint, GitLens"
   fi
 }
 
@@ -1042,38 +1187,47 @@ execute_node() {
       local nvm_ok=false
       if [ "$PLATFORM" = "mac" ]; then
         if [ -d "$HOME/.nvm" ] || has_cmd nvm; then
-          skip "nvm already installed."; add_summary "nvm" "OK" "-" "already installed"
+          walk_past "nvm"; add_summary "nvm" "SKIPPED" "-" "already in the pack"
           nvm_ok=true
-        elif curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash; then
-          ok "nvm installed."; add_summary "nvm" "OK" "-" "newly installed"
+        elif curl -fsSL -o "$HOME/.sherpa-nvm-install.sh" https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh && bash "$HOME/.sherpa-nvm-install.sh"; then
+          rm -f "$HOME/.sherpa-nvm-install.sh"
+          ok "nvm is in the pack."; add_summary "nvm" "OK" "-" "fresh off the trail"
           nvm_ok=true
         else
-          fail "nvm install failed."; add_summary "nvm" "FAILED" "-" "install command failed"
+          rm -f "$HOME/.sherpa-nvm-install.sh"
+          slipped "nvm"; add_summary "nvm" "FAILED" "-" "install slipped"
         fi
       else
         if has_cmd nvm; then
-          skip "nvm-windows already installed."; add_summary "nvm-windows" "OK" "-" "already installed"
+          walk_past "nvm-windows"; add_summary "nvm-windows" "SKIPPED" "-" "already in the pack"
           nvm_ok=true
         elif install_pkg "" "CoreyButler.NVMforWindows"; then
-          ok "nvm-windows installed."; add_summary "nvm-windows" "OK" "-" "newly installed"
+          ok "nvm-windows is in the pack."; add_summary "nvm-windows" "OK" "-" "fresh off the trail"
           nvm_ok=true
         else
-          fail "nvm-windows install failed."; add_summary "nvm-windows" "FAILED" "-" "install command failed"
+          slipped "nvm-windows"; add_summary "nvm-windows" "FAILED" "-" "install slipped"
         fi
       fi
       if $nvm_ok; then
         install_node_versions_via_nvm
+      else
+        add_summary "Node versions" "SKIPPED" "-" "nvm slipped, so versions stayed home"
       fi
       ;;
     1)
-      step "Node.js LTS..."
-      if install_pkg "node@22" "OpenJS.NodeJS.LTS"; then
-        ok "Node.js LTS installed."; add_summary "Node.js" "OK" "$(get_version node)" "newly installed"
+      if has_cmd node; then
+        walk_past "Node.js"
+        add_summary "Node.js" "SKIPPED" "$(get_version node)" "already in the pack"
       else
-        fail "Node.js install failed."; add_summary "Node.js" "FAILED" "-" "install command failed"
+        step "Node.js LTS..."
+        if install_pkg "node@22" "OpenJS.NodeJS.LTS"; then
+          ok "Node.js is in the pack."; add_summary "Node.js" "OK" "$(get_version node)" "fresh off the trail"
+        else
+          slipped "Node.js"; add_summary "Node.js" "FAILED" "-" "install slipped"
+        fi
       fi
       ;;
-    2) add_summary "Node.js" "SKIPPED" "-" "user chose Skip" ;;
+    2) add_summary "Node.js" "SKIPPED" "-" "$(left_behind)" ;;
   esac
 }
 
@@ -1100,6 +1254,17 @@ nvm_install_one() {
   fi
 }
 
+# nvm version prints "v22.x" when that version is already installed, "N/A" otherwise.
+nvm_has() {
+  local ver="$1" out=""
+  if [ "$ver" = "lts" ]; then
+    out="$(nvm version --lts 2>/dev/null || true)"
+  else
+    out="$(nvm version "$ver" 2>/dev/null || true)"
+  fi
+  [[ "$out" == v* ]]
+}
+
 install_node_versions_via_nvm() {
   step "Node.js versions via nvm..."
   if ! load_nvm; then
@@ -1118,13 +1283,16 @@ install_node_versions_via_nvm() {
     return
   fi
 
-  local ver installed=0 failed=0
+  local ver installed=0 failed=0 skipped=0
   for ver in "${NODE_VERSIONS[@]}"; do
-    if nvm_install_one "$ver"; then
-      ok "Node $ver installed."
+    if nvm_has "$ver"; then
+      walk_past "Node $ver"
+      skipped=$((skipped + 1))
+    elif nvm_install_one "$ver"; then
+      ok "Node $ver is in the pack."
       installed=$((installed + 1))
     else
-      fail "Node $ver install failed."
+      slipped "Node $ver"
       failed=$((failed + 1))
     fi
   done
@@ -1136,10 +1304,12 @@ install_node_versions_via_nvm() {
     nvm use "$NODE_DEFAULT" >/dev/null 2>&1 || true
   fi
 
-  if [ $failed -eq 0 ]; then
-    add_summary "Node versions" "OK" "$NODE_DEFAULT" "installed: ${NODE_VERSIONS[*]} (default $NODE_DEFAULT)"
+  if [ "$failed" -gt 0 ]; then
+    add_summary "Node versions" "FAILED" "-" "$installed packed, $skipped already there, $failed slipped"
+  elif [ "$installed" -eq 0 ]; then
+    add_summary "Node versions" "SKIPPED" "$NODE_DEFAULT" "already in the pack"
   else
-    add_summary "Node versions" "FAILED" "-" "$installed OK, $failed failed"
+    add_summary "Node versions" "OK" "$NODE_DEFAULT" "packed: ${NODE_VERSIONS[*]} (default $NODE_DEFAULT)"
   fi
 }
 
@@ -1149,34 +1319,53 @@ install_node_versions_via_nvm() {
 execute_package_manager() {
   case $PKG_MANAGER_CHOICE in
     0)
-      add_summary "Package manager" "OK" "npm" "using npm (default)"
+      if has_cmd npm || has_cmd node; then
+        if has_cmd npm; then
+          walk_past "npm"
+          add_summary "Package manager" "SKIPPED" "$(get_version npm)" "already in the pack"
+        else
+          add_summary "Package manager" "OK" "npm" "tagged along with Node"
+        fi
+      else
+        add_summary "Package manager" "SKIPPED" "-" "Node isn't here, so npm stayed home"
+      fi
       ;;
     1)
-      step "pnpm via corepack..."
-      if ! has_cmd node; then
-        fail "Node.js not found -- can't enable corepack."
-        add_summary "pnpm" "FAILED" "-" "Node.js not installed"
-      elif corepack enable >/dev/null 2>&1 && corepack prepare pnpm@latest --activate >/dev/null 2>&1; then
-        ok "pnpm activated via corepack."
-        add_summary "pnpm" "OK" "$(get_version pnpm)" "activated via corepack"
-        NEXT_STEPS+=("Open a new terminal, then: pnpm --version")
+      if has_cmd pnpm; then
+        walk_past "pnpm"
+        add_summary "pnpm" "SKIPPED" "$(get_version pnpm)" "already in the pack"
+      elif ! has_cmd node; then
+        skip "Node isn't here, so pnpm stays home."
+        add_summary "pnpm" "SKIPPED" "-" "Node isn't here, so pnpm stayed home"
       else
-        fail "corepack/pnpm setup failed."
-        add_summary "pnpm" "FAILED" "-" "corepack command failed"
+        step "pnpm via corepack..."
+        if corepack enable >/dev/null 2>&1 && corepack prepare pnpm@latest --activate >/dev/null 2>&1; then
+          ok "pnpm is in the pack."
+          add_summary "pnpm" "OK" "$(get_version pnpm)" "activated via corepack"
+          NEXT_STEPS+=("Open a new terminal, then: pnpm --version")
+        else
+          slipped "pnpm"
+          add_summary "pnpm" "FAILED" "-" "corepack slipped"
+        fi
       fi
       ;;
     2)
-      step "yarn via corepack..."
-      if ! has_cmd node; then
-        fail "Node.js not found -- can't enable corepack."
-        add_summary "yarn" "FAILED" "-" "Node.js not installed"
-      elif corepack enable >/dev/null 2>&1 && corepack prepare yarn@stable --activate >/dev/null 2>&1; then
-        ok "yarn activated via corepack."
-        add_summary "yarn" "OK" "$(get_version yarn)" "activated via corepack"
-        NEXT_STEPS+=("Open a new terminal, then: yarn --version")
+      if has_cmd yarn; then
+        walk_past "yarn"
+        add_summary "yarn" "SKIPPED" "$(get_version yarn)" "already in the pack"
+      elif ! has_cmd node; then
+        skip "Node isn't here, so yarn stays home."
+        add_summary "yarn" "SKIPPED" "-" "Node isn't here, so yarn stayed home"
       else
-        fail "corepack/yarn setup failed."
-        add_summary "yarn" "FAILED" "-" "corepack command failed"
+        step "yarn via corepack..."
+        if corepack enable >/dev/null 2>&1 && corepack prepare yarn@stable --activate >/dev/null 2>&1; then
+          ok "yarn is in the pack."
+          add_summary "yarn" "OK" "$(get_version yarn)" "activated via corepack"
+          NEXT_STEPS+=("Open a new terminal, then: yarn --version")
+        else
+          slipped "yarn"
+          add_summary "yarn" "FAILED" "-" "corepack slipped"
+        fi
       fi
       ;;
   esac
@@ -1188,39 +1377,44 @@ execute_python() {
       step "pyenv..."
       if [ "$PLATFORM" = "mac" ]; then
         if has_cmd pyenv; then
-          skip "pyenv already installed."; add_summary "pyenv" "OK" "-" "already installed"
+          walk_past "pyenv"; add_summary "pyenv" "SKIPPED" "-" "already in the pack"
         elif install_pkg "pyenv" ""; then
-          ok "pyenv installed."; add_summary "pyenv" "OK" "-" "newly installed"
+          ok "pyenv is in the pack."; add_summary "pyenv" "OK" "-" "fresh off the trail"
           # Single-quoted on purpose: this is instructional text for the user, not meant to expand.
           # shellcheck disable=SC2016
           NEXT_STEPS+=('Add eval "$(pyenv init -)" to ~/.zshrc, restart terminal, then: pyenv install 3.12.4 && pyenv global 3.12.4')
         else
-          fail "pyenv install failed."; add_summary "pyenv" "FAILED" "-" "install command failed"
+          slipped "pyenv"; add_summary "pyenv" "FAILED" "-" "install slipped"
         fi
       else
         if has_cmd pyenv; then
-          skip "pyenv-win already installed."; add_summary "pyenv-win" "OK" "-" "already installed"
+          walk_past "pyenv-win"; add_summary "pyenv-win" "SKIPPED" "-" "already in the pack"
         else
           # No reliable winget package as of writing -- use the official installer script.
           if powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
             "Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/pyenv-win/pyenv-win/master/pyenv-win/install-pyenv-win.ps1' -OutFile \"\$env:TEMP\install-pyenv-win.ps1\"; & \"\$env:TEMP\install-pyenv-win.ps1\""; then
-            ok "pyenv-win installed."; add_summary "pyenv-win" "OK" "-" "newly installed"
+            ok "pyenv-win is in the pack."; add_summary "pyenv-win" "OK" "-" "fresh off the trail"
             NEXT_STEPS+=("Open a NEW terminal, then: pyenv install 3.12.4 && pyenv global 3.12.4")
           else
-            fail "pyenv-win install failed."; add_summary "pyenv-win" "FAILED" "-" "install command failed"
+            slipped "pyenv-win"; add_summary "pyenv-win" "FAILED" "-" "install slipped"
           fi
         fi
       fi
       ;;
     1)
-      step "Python 3..."
-      if install_pkg "python@3.12" "Python.Python.3.12"; then
-        ok "Python installed."; add_summary "Python" "OK" "$(get_version python3)" "newly installed"
+      if has_cmd python3; then
+        walk_past "Python"
+        add_summary "Python" "SKIPPED" "$(get_version python3)" "already in the pack"
       else
-        fail "Python install failed."; add_summary "Python" "FAILED" "-" "install command failed"
+        step "Python 3..."
+        if install_pkg "python@3.12" "Python.Python.3.12"; then
+          ok "Python is in the pack."; add_summary "Python" "OK" "$(get_version python3)" "fresh off the trail"
+        else
+          slipped "Python"; add_summary "Python" "FAILED" "-" "install slipped"
+        fi
       fi
       ;;
-    2) add_summary "Python" "SKIPPED" "-" "user chose Skip" ;;
+    2) add_summary "Python" "SKIPPED" "-" "$(left_behind)" ;;
   esac
 }
 
@@ -1234,22 +1428,24 @@ mac_app_installed() { [ -d "/Applications/$1" ]; }
 # Shared logic for CLI tools we can detect via has_cmd.
 execute_extra_cli() {
   local friendly="$1" want="$2" brew_formula="$3" winget_id="$4" vcmd="$5"
+  EXTRA_FRESH=false
   if ! $want; then
-    add_summary "$friendly" "SKIPPED" "-" "user chose Skip"
+    add_summary "$friendly" "SKIPPED" "-" "$(left_behind)"
+    return
+  fi
+  if has_cmd "$vcmd"; then
+    walk_past "$friendly"
+    add_summary "$friendly" "SKIPPED" "$(get_version "$vcmd")" "already in the pack"
     return
   fi
   step "$friendly..."
-  if has_cmd "$vcmd"; then
-    skip "$friendly already installed."
-    add_summary "$friendly" "OK" "$(get_version "$vcmd")" "already installed"
-    return
-  fi
   if install_pkg "$brew_formula" "$winget_id"; then
-    ok "$friendly installed."
-    add_summary "$friendly" "OK" "$(get_version "$vcmd")" "newly installed"
+    ok "$friendly is in the pack."
+    add_summary "$friendly" "OK" "$(get_version "$vcmd")" "fresh off the trail"
+    EXTRA_FRESH=true
   else
-    fail "$friendly install failed."
-    add_summary "$friendly" "FAILED" "-" "install command failed"
+    slipped "$friendly"
+    add_summary "$friendly" "FAILED" "-" "install slipped"
   fi
 }
 
@@ -1258,21 +1454,21 @@ execute_extra_cli() {
 execute_extra_gui() {
   local friendly="$1" want="$2" brew_cask="$3" winget_id="$4" mac_app="$5"
   if ! $want; then
-    add_summary "$friendly" "SKIPPED" "-" "user chose Skip"
+    add_summary "$friendly" "SKIPPED" "-" "$(left_behind)"
+    return
+  fi
+  if [ "$PLATFORM" = "mac" ] && mac_app_installed "$mac_app"; then
+    walk_past "$friendly"
+    add_summary "$friendly" "SKIPPED" "-" "already in the pack"
     return
   fi
   step "$friendly..."
-  if [ "$PLATFORM" = "mac" ] && mac_app_installed "$mac_app"; then
-    skip "$friendly already installed."
-    add_summary "$friendly" "OK" "-" "already installed"
-    return
-  fi
   if install_pkg "$brew_cask" "$winget_id" "true"; then
-    ok "$friendly installed."
-    add_summary "$friendly" "OK" "-" "newly installed"
+    ok "$friendly is in the pack."
+    add_summary "$friendly" "OK" "-" "fresh off the trail"
   else
-    fail "$friendly install failed."
-    add_summary "$friendly" "FAILED" "-" "install command failed"
+    slipped "$friendly"
+    add_summary "$friendly" "FAILED" "-" "install slipped"
   fi
 }
 
@@ -1284,6 +1480,7 @@ execute_extras() {
   execute_extra_gui "Firefox" "$WANT_FIREFOX" "firefox" "Mozilla.Firefox" "Firefox.app"
   execute_extra_cli "jq" "$WANT_JQ" "jq" "jqlang.jq" "jq"
   execute_starship
+  execute_extra_gui "Claude Desktop" "$WANT_CLAUDE" "claude" "Anthropic.Claude" "Claude.app"
 }
 
 # execute_starship -- single static binary on both platforms via
@@ -1292,7 +1489,7 @@ execute_extras() {
 # without them seeing it first.
 execute_starship() {
   execute_extra_cli "Starship" "$WANT_STARSHIP" "starship" "Starship.Starship" "starship"
-  if $WANT_STARSHIP && has_cmd starship; then
+  if $EXTRA_FRESH && has_cmd starship; then
     local rc_file="$HOME/.bashrc"
     [ "$PLATFORM" = "mac" ] && rc_file="$HOME/.zshrc"
     NEXT_STEPS+=("Enable the Starship prompt: add 'eval \"\$(starship init bash)\"' (swap bash for zsh if that's your shell) to the end of $rc_file, then restart your terminal.")
@@ -1301,25 +1498,33 @@ execute_starship() {
 
 execute_git_config() {
   if ! $GITCONFIG_NEEDED; then
-    add_summary "git config" "SKIPPED" "-" "already set or user declined"
+    if git config --global user.name >/dev/null 2>&1 && git config --global user.email >/dev/null 2>&1; then
+      walk_past "git config"
+      add_summary "git config" "SKIPPED" "-" "already in the pack"
+    else
+      add_summary "git config" "SKIPPED" "-" "$(left_behind)"
+    fi
     return
   fi
-  git config --global user.name "$GITCONFIG_NAME"
-  git config --global user.email "$GITCONFIG_EMAIL"
-  ok "git config set ($GITCONFIG_NAME <$GITCONFIG_EMAIL>)."
-  add_summary "git config" "OK" "-" "newly configured"
+  if git config --global user.name "$GITCONFIG_NAME" && git config --global user.email "$GITCONFIG_EMAIL"; then
+    ok "Git now knows you as $GITCONFIG_NAME <$GITCONFIG_EMAIL>."
+    add_summary "git config" "OK" "-" "fresh off the trail"
+  else
+    slipped "git config"
+    add_summary "git config" "FAILED" "-" "git config slipped"
+  fi
 }
 
 execute_gh_auth() {
   if ! $GIT_SSH_SETUP; then return; fi
   if ! has_cmd gh; then
-    fail "GitHub CLI (gh) is required for SSH setup but is not installed."
+    slipped "GitHub auth"
     add_summary "GitHub auth" "FAILED" "-" "gh not installed"
     return
   fi
   if gh auth status >/dev/null 2>&1; then
-    ok "gh already authenticated."
-    add_summary "GitHub auth" "OK" "-" "already authenticated"
+    walk_past "GitHub auth"
+    add_summary "GitHub auth" "SKIPPED" "-" "already in the pack"
     return
   fi
   step "GitHub authentication..."
@@ -1329,7 +1534,7 @@ execute_gh_auth() {
   read -rs -p "  Paste GitHub token (hidden): " token
   echo ""
   if [ -z "$token" ]; then
-    fail "No token entered."
+    slipped "GitHub auth"
     add_summary "GitHub auth" "FAILED" "-" "no token provided"
     return
   fi
@@ -1337,23 +1542,25 @@ execute_gh_auth() {
     ok "GitHub authenticated."
     add_summary "GitHub auth" "OK" "-" "authenticated via token"
   else
-    fail "gh auth login failed."
+    slipped "GitHub auth"
     add_summary "GitHub auth" "FAILED" "-" "gh auth login failed"
   fi
 }
 
 execute_ssh_setup() {
   if ! $GIT_SSH_SETUP; then
-    add_summary "SSH key" "SKIPPED" "-" "not requested"
+    add_summary "SSH key" "SKIPPED" "-" "$(left_behind)"
     return
   fi
   if ! has_cmd gh; then
+    slipped "SSH key"
     add_summary "SSH key" "FAILED" "-" "gh not installed"
     return
   fi
 
   execute_gh_auth
   if ! gh auth status >/dev/null 2>&1; then
+    slipped "SSH key"
     add_summary "SSH key" "FAILED" "-" "gh not authenticated"
     return
   fi
@@ -1363,102 +1570,171 @@ execute_ssh_setup() {
   local email
   email="${GITCONFIG_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
   if [ -f "$key_path" ]; then
-    skip "SSH key already exists at $key_path -- not overwriting."
-    add_summary "SSH key" "OK" "-" "already existed"
+    walk_past "SSH key"
+    add_summary "SSH key" "SKIPPED" "-" "already in the pack"
   else
     mkdir -p "$HOME/.ssh"
     chmod 700 "$HOME/.ssh"
     if ssh-keygen -t ed25519 -C "${email:-sherpa@$(hostname)}" -f "$key_path" -N ""; then
-      ok "SSH key generated at $key_path"
-      add_summary "SSH key" "OK" "-" "newly generated"
+      ok "Minted an SSH key at $key_path"
+      add_summary "SSH key" "OK" "-" "fresh off the trail"
     else
-      fail "SSH key generation failed."
-      add_summary "SSH key" "FAILED" "-" "ssh-keygen failed"
+      slipped "SSH key"
+      add_summary "SSH key" "FAILED" "-" "ssh-keygen slipped"
       return
     fi
   fi
 
   if [ ! -f "${key_path}.pub" ]; then
-    fail "Public key not found at ${key_path}.pub"
+    slipped "SSH upload"
     add_summary "SSH upload" "FAILED" "-" "missing public key"
     return
   fi
 
-  step "Uploading SSH key to GitHub via gh..."
-  local title
+  local key_blob title
+  key_blob="$(awk '{print $2}' "${key_path}.pub" 2>/dev/null || true)"
+  if [ -n "$key_blob" ] && gh ssh-key list 2>/dev/null | grep -q "$key_blob"; then
+    walk_past "SSH upload"
+    add_summary "SSH upload" "SKIPPED" "-" "already in the pack"
+    return
+  fi
+
+  step "Handing the SSH key to GitHub..."
   title="$(hostname)-sherpa"
   if gh ssh-key add "${key_path}.pub" -t "$title" >/dev/null 2>&1; then
-    ok "SSH key uploaded to GitHub."
+    ok "GitHub has the key."
     add_summary "SSH upload" "OK" "-" "uploaded via gh"
   else
-    fail "Could not upload SSH key (it may already be registered)."
-    add_summary "SSH upload" "FAILED" "-" "gh ssh-key add failed"
+    slipped "SSH upload"
+    add_summary "SSH upload" "FAILED" "-" "gh ssh-key add slipped"
+  fi
+}
+
+# One repo is one box on the yak. A failed clone does not stop the next repo.
+clone_one() {
+  local raw="$1" url name dest
+  url="$(resolve_repo_url "$raw")"
+  name="$(basename "$url" .git)"
+  dest="$CLONE_DIR/$name"
+  if [ -d "$dest/.git" ]; then
+    walk_past "$name"
+    add_summary "$name" "SKIPPED" "-" "already in the pack"
+    return 0
+  fi
+  if git clone "$url" "$dest"; then
+    ok "$name is in the basket ($dest)."
+    add_summary "$name" "OK" "-" "fresh off the trail"
+  else
+    slipped "$name"
+    add_summary "$name" "FAILED" "-" "clone slipped"
   fi
 }
 
 execute_clone_repos() {
   if ! $WANT_CLONE; then
-    add_summary "Clone repo(s)" "SKIPPED" "-" "user chose Skip"
+    add_summary "Clone repo(s)" "SKIPPED" "-" "$(left_behind)"
     return
   fi
-  step "Cloning repo(s)..."
-  mkdir -p "$CLONE_DIR"
-  local cloned=0 failed=0 repo url dest name
+  step "Repos..."
+  mkdir -p "$CLONE_DIR" || slipped "clone folder"
+  local repo url
   if [ ${#CLONE_REPOS[@]} -gt 0 ]; then
     for repo in "${CLONE_REPOS[@]}"; do
-      url="$(resolve_repo_url "$repo")"
-      name="$(basename "$url" .git)"
-      dest="$CLONE_DIR/$name"
-      if git clone "$url" "$dest"; then
-        ok "Cloned into $dest"
-        cloned=$((cloned + 1))
-      else
-        fail "Failed to clone $url"
-        failed=$((failed + 1))
-      fi
+      clone_one "$repo" || true
     done
-  else
-    IFS=',' read -ra urls <<< "$CLONE_URLS_RAW"
-    for url in "${urls[@]}"; do
-      url=$(echo "$url" | xargs)
-      [ -z "$url" ] && continue
-      url="$(resolve_repo_url "$url")"
-      dest="$CLONE_DIR/$(basename "$url" .git)"
-      if git clone "$url" "$dest"; then
-        ok "Cloned into $dest"
-        cloned=$((cloned + 1))
-      else
-        fail "Failed to clone $url"
-        failed=$((failed + 1))
-      fi
-    done
+    return
   fi
-  if [ $failed -eq 0 ]; then
-    add_summary "Clone repo(s)" "OK" "-" "$cloned cloned into $CLONE_DIR"
-  else
-    add_summary "Clone repo(s)" "FAILED" "-" "$cloned OK, $failed failed"
-  fi
+  [ -n "${CLONE_URLS_RAW:-}" ] || return
+  local urls=()
+  IFS=',' read -ra urls <<< "$CLONE_URLS_RAW"
+  [ "${#urls[@]}" -gt 0 ] || return
+  for url in "${urls[@]}"; do
+    url=$(echo "$url" | xargs)
+    [ -z "$url" ] && continue
+    clone_one "$url" || true
+  done
 }
 
 # =============================================================================
 # Main
 # =============================================================================
 
+# One random camp note, then SMILE every time.
+# The note uses the terminal's own text color so it stays readable on a
+# light background. SMILE is bright yellow, which still shows up there.
+sign_off() {
+  local gold=$'\033[1;93m'
+  local notes=(
+    "Have a glass of water."
+    "Drop your shoulders."
+    "Unclench your jaw."
+    "Blink. You forgot."
+    "Roll your shoulders back."
+    "Look out a window for a second."
+    "Wiggle your toes. They're still on the job."
+    "The yak sat down. You can too."
+    "Drink something. The summit can wait."
+    "Your face is doing the concentrating thing. Knock it off."
+  )
+  local note="${notes[$((RANDOM % ${#notes[@]}))]}"
+  echo ""
+  echo -e "${GRAY}A note from camp:${NC}"
+  echo -e "${BOLD}   ${note}${NC}"
+  echo ""
+  echo -e "${gold}"
+  cat << 'SMILE'
+   ███    █   █   ███   █     ███
+   █      ██ ██    █    █     █
+   ███    █ █ █    █    █     ███
+     █    █   █    █    █     █
+   ███    █   █   ███   ███   ███
+SMILE
+  echo -e "${NC}"
+  echo -e "${GRAY}The mountain will still be there when you get back.${NC}"
+  echo ""
+}
+
+farewell() {
+  local any=false s
+  if [ ${#SUMMARY_STATUS[@]} -gt 0 ]; then
+    for s in "${SUMMARY_STATUS[@]}"; do
+      [ "$s" = "FAILED" ] && any=true
+    done
+  fi
+  echo ""
+  if $any; then
+    echo -e "${YELLOW}Some things slipped off the yak. The rest still made it to camp.${NC}"
+    echo -e "${GRAY}Run me again. What's already packed gets a wave, not another receipt.${NC}"
+  elif $PROFILE_MODE; then
+    echo -e "${GREEN}Menu's served. Try not to start a food fight.${NC}"
+  else
+    echo -e "${GREEN}Basket's packed. Go build something ridiculous.${NC}"
+  fi
+  sign_off
+  $any && exit 1
+  exit 0
+}
+
 main() {
   parse_args "$@"
   banner
   detect_platform
-  ensure_pkg_manager
 
   if $PROFILE_MODE; then
     load_profile
-    echo -e "\nUsing profile: ${BOLD}$(basename "$PROFILE_FILE")${NC}"
-    echo -e "${GRAY}Review the plan below, then confirm to install.${NC}\n"
+    echo -e "\n${CYAN}${BOLD}Catered.${NC} The menu is ${BOLD}${PROFILE_NAME}${NC}."
+    echo -e "${GRAY}No sending plates back. If the soup spills, dessert still shows up.${NC}"
+    echo -e "${GRAY}Anything already on the table gets a nod, not a second serving.${NC}\n"
+    ensure_pkg_manager
+    echo -e "${GRAY}Glance at the menu, then we cook. Your name and email are the only personal questions.${NC}\n"
     plan_from_profile
-    gather_git_config_interactive
     print_plan_and_confirm
+    gather_git_config_interactive
   else
-    echo -e "\nA few questions first -- nothing installs until you confirm the plan.\n"
+    echo -e "\n${CYAN}${BOLD}Picnic.${NC} You pack the basket."
+    echo -e "${GRAY}Say no to anything you don't want to carry. If a jar breaks, the sandwiches still make it.${NC}\n"
+    ensure_pkg_manager
+    echo -e "${GRAY}A few questions first. Nothing else gets packed until you say so.${NC}\n"
     gather_git
     gather_ide
     gather_node
@@ -1470,18 +1746,20 @@ main() {
     print_plan_and_confirm
   fi
 
-  execute_git
-  execute_ide
-  execute_node
-  execute_package_manager
-  execute_python
-  execute_extras
-  execute_git_config
-  execute_ssh_setup
-  execute_clone_repos
+  # No set -e anywhere in this script. One spilled dish must not end the meal,
+  # so each of these keeps going even when the one before it returns sad.
+  execute_git || true
+  execute_ide || true
+  execute_node || true
+  execute_package_manager || true
+  execute_python || true
+  execute_extras || true
+  execute_git_config || true
+  execute_ssh_setup || true
+  execute_clone_repos || true
 
   print_summary_table
-  echo "Close and reopen your terminal so PATH changes take effect, then verify with:"
+  echo -e "${GRAY}Pop a new terminal so the new gear can find the trail, then poke at:${NC}"
   echo -e "  ${CYAN}git --version${NC}"
   echo -e "  ${CYAN}node --version${NC}"
   echo -e "  ${CYAN}python3 --version${NC}"
@@ -1490,7 +1768,7 @@ main() {
     2) echo -e "  ${CYAN}yarn --version${NC}" ;;
   esac
   $WANT_STARSHIP && echo -e "  ${CYAN}starship --version${NC}"
-  echo ""
+  farewell
 }
 
 main "$@"

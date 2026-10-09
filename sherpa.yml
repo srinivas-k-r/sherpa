@@ -34,7 +34,7 @@ package_manager: pnpm       # npm | pnpm | yarn
 
 # --- IDE ---------------------------------------------------------------------
 ide:
-  choice: skip              # zed | vscode | both | skip
+  choice: skip              # zed | vscode | cursor | both | skip
   vscode_extensions: true   # only used if vscode or both
 
 # --- Optional tools (delete lines you don't want) ----------------------------
@@ -46,6 +46,7 @@ extras:
   # - chrome
   # - firefox
   # - starship
+  # - claude                  # Claude Desktop
 
 # --- Git / SSH / clone -------------------------------------------------------
 git:
